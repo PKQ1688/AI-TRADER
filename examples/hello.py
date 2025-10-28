@@ -1,8 +1,9 @@
+"""最小示例：调用 SDK 输出问候语。"""
+
 from ai_trader import say_hello
 
 
 def main() -> None:
-    """示例脚本：使用 SDK 输出问候语。"""
     print(say_hello())
 
 
