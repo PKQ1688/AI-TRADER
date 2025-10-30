@@ -55,7 +55,9 @@ class CcxtGateway:
         """从交易所拉取 K 线数据并转换为标准结构。"""
 
         client = self._get_client()
-        raw_ohlcv: List[List[Any]] = client.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        raw_ohlcv: List[List[Any]] = client.fetch_ohlcv(
+            symbol, timeframe=timeframe, limit=limit
+        )
 
         candles: List[Candle] = []
         for entry in raw_ohlcv:

@@ -94,7 +94,9 @@ def _calculate_macd(
     return macd_line, signal_line, histogram, previous_histogram
 
 
-def _determine_signal(histogram: float, previous_histogram: Optional[float]) -> MacdSignal:
+def _determine_signal(
+    histogram: float, previous_histogram: Optional[float]
+) -> MacdSignal:
     if previous_histogram is None:
         return MacdSignal.HOLD
 
@@ -127,11 +129,16 @@ def build_macd_tool(
         target_timeframe = timeframe or default_timeframe
         target_limit = limit or default_limit
 
-        candles = data_gateway.fetch_ohlcv(target_symbol, target_timeframe, target_limit)
+        candles = data_gateway.fetch_ohlcv(
+            target_symbol, target_timeframe, target_limit
+        )
         closes = [candle.close for candle in candles]
 
         macd_line, signal_line, histogram, prev_hist = _calculate_macd(
-            closes, fast_period=fast_period, slow_period=slow_period, signal_period=signal_period
+            closes,
+            fast_period=fast_period,
+            slow_period=slow_period,
+            signal_period=signal_period,
         )
         signal = _determine_signal(histogram, prev_hist)
 

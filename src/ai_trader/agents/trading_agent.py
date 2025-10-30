@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Any, MutableSequence, Optional, List, Sequence
+from typing import Any, Literal, MutableSequence, Optional, List, Sequence
 
 from agno.agent import Agent
 from agno.models.deepseek.deepseek import DeepSeek
+from pydantic import BaseModel
 
 from ..config import Settings
 from ..data import DataGateway
 from ..indicators import build_macd_tool
+
+
+class TradingSignalSchema(BaseModel):
+    """约束模型仅输出买/卖/观望信号。"""
+
+    signal: Literal["buy", "sell", "hold"]
 
 
 def _build_instructions(settings: Settings) -> List[str]:
@@ -17,10 +24,9 @@ def _build_instructions(settings: Settings) -> List[str]:
     timeframe = settings.timeframe
     return [
         f"你是面向专业交易员的量化助手，负责分析交易对 {symbol} 在周期 {timeframe} 的行情。",
-        "始终调用工具 `macd_signal` 获取最新指标；禁止凭空编造数据。",
-        "拿到工具返回后，评估 MACD 与柱状图的变化，给出简洁的买/卖/观望建议。",
-        "最终仅输出一个 JSON 对象，字段包含 signal、reasoning、macd、signal_line、histogram、previous_histogram、symbol、timeframe、candles_used。",
-        "若工具计算失败，应返回 reason 字段描述原因，并将 signal 设置为 hold。",
+        "必须调用工具 `macd_signal` 获取最新指标，严禁凭空编造行情数据。",
+        "基于工具返回的 MACD 与柱状图变化，判断应买入、卖出或继续观望。",
+        '最终仅输出 JSON 对象 {"signal": "buy"|"sell"|"hold"}，不得包含任何额外字段或说明文字。',
     ]
 
 
@@ -63,5 +69,6 @@ def create_trading_agent(
         instructions=instructions,
         dependencies={"settings": settings},
         add_dependencies_to_context=False,
-        use_json_mode=False,
+        output_schema=TradingSignalSchema,
+        use_json_mode=True,
     )

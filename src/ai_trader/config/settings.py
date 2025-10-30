@@ -1,4 +1,5 @@
 """统一加载与维护运行时配置。"""
+
 from dataclasses import dataclass
 from os import getenv
 from typing import Optional
@@ -39,7 +40,9 @@ def load_settings(
     """生成配置实例，非敏感配置来自默认值或函数参数。"""
 
     api_key = getenv("OPENAI_API_KEY") or getenv("DEEPSEEK_API_KEY")
-    base_url = getenv("OPENAI_BASE_URL") or getenv("DEEPSEEK_BASE_URL") or DEFAULT_BASE_URL
+    base_url = (
+        getenv("OPENAI_BASE_URL") or getenv("DEEPSEEK_BASE_URL") or DEFAULT_BASE_URL
+    )
 
     return Settings(
         exchange_id=exchange_id or DEFAULT_EXCHANGE_ID,

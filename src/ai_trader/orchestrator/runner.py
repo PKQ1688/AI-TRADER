@@ -10,6 +10,9 @@ from agno.run.agent import RunOutput
 from ..agents import create_trading_agent
 from ..config import Settings, load_settings
 from ..data import CcxtGateway
+from ..core.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def _build_prompt(settings: Settings) -> str:
@@ -19,19 +22,19 @@ def _build_prompt(settings: Settings) -> str:
     )
 
 
-def _find_dict_with_macd(payload: Any) -> Optional[Dict[str, Any]]:
-    """递归查找包含 MACD 结果的字典。"""
+def _find_signal_payload(payload: Any) -> Optional[Dict[str, Any]]:
+    """递归寻找包含信号字段的结构，优先复用工具输出。"""
 
     if isinstance(payload, dict):
-        if "macd" in payload and "signal" in payload:
+        if "signal" in payload:
             return payload
         for value in payload.values():
-            result = _find_dict_with_macd(value)
+            result = _find_signal_payload(value)
             if result is not None:
                 return result
     elif isinstance(payload, (list, tuple)):
         for item in payload:
-            result = _find_dict_with_macd(item)
+            result = _find_signal_payload(item)
             if result is not None:
                 return result
     elif isinstance(payload, str):
@@ -39,72 +42,34 @@ def _find_dict_with_macd(payload: Any) -> Optional[Dict[str, Any]]:
             decoded = json.loads(payload)
         except json.JSONDecodeError:
             return None
-        return _find_dict_with_macd(decoded)
+        return _find_signal_payload(decoded)
 
     return None
 
 
-def _extract_reasoning(payload: Dict[str, Any]) -> str:
-    """从模型响应中提取可用的分析理由。"""
-
-    parsed = payload.get("parsed")
-    if isinstance(parsed, dict):
-        reasoning = parsed.get("reasoning")
-        if isinstance(reasoning, str) and reasoning.strip():
-            return reasoning.strip()
-
-    content = payload.get("content")
-    if isinstance(content, str) and content.strip():
-        return content.strip()
-
-    messages = payload.get("messages")
-    if isinstance(messages, list):
-        for message in reversed(messages):
-            if not isinstance(message, dict):
-                continue
-            if message.get("role") != "assistant":
-                continue
-            msg_content = message.get("content")
-            if isinstance(msg_content, str) and msg_content.strip():
-                return msg_content.strip()
-            if isinstance(msg_content, list):
-                for item in msg_content:
-                    if not isinstance(item, dict):
-                        continue
-                    text = item.get("text")
-                    if isinstance(text, str) and text.strip():
-                        return text.strip()
-
-    return "模型未返回有效理由。"
-
-
-def _build_normalized_result(payload: Dict[str, Any], settings: Settings) -> Dict[str, Any]:
-    """统一输出结构，确保关键字段齐备。"""
+def _build_normalized_result(
+    payload: Dict[str, Any], settings: Settings
+) -> Dict[str, Any]:
+    """提取模型或工具返回的信号，统一封装。"""
 
     parsed = payload.get("parsed") if isinstance(payload.get("parsed"), dict) else {}
-    tool_result = _find_dict_with_macd(payload.get("tools")) or {}
+    signal = parsed.get("signal") if isinstance(parsed, dict) else None
 
-    merged: Dict[str, Any] = {}
-    if isinstance(tool_result, dict):
-        merged.update(tool_result)
-    if isinstance(parsed, dict):
-        merged.update({k: v for k, v in parsed.items() if v is not None})
+    if not signal:
+        tool_result = _find_signal_payload(payload.get("tools"))
+        if isinstance(tool_result, dict):
+            tool_signal = tool_result.get("signal")
+            if isinstance(tool_signal, str):
+                signal = tool_signal
 
-    reasoning = merged.get("reasoning")
-    if not reasoning:
-        merged["reasoning"] = _extract_reasoning(payload)
+    if not signal:
+        signal = "hold"
 
-    merged.setdefault("signal", "hold")
-    merged.setdefault("macd", tool_result.get("macd"))
-    merged.setdefault("signal_line", tool_result.get("signal_line"))
-    merged.setdefault("histogram", tool_result.get("histogram"))
-    merged.setdefault("previous_histogram", tool_result.get("previous_histogram"))
-    merged.setdefault("candles_used", tool_result.get("candles_used"))
-
-    merged["symbol"] = merged.get("symbol") or settings.symbol
-    merged["timeframe"] = merged.get("timeframe") or settings.timeframe
-
-    return merged
+    return {
+        "signal": signal,
+        "symbol": settings.symbol,
+        "timeframe": settings.timeframe,
+    }
 
 
 def _serialize_response(response: RunOutput, settings: Settings) -> Dict[str, Any]:
@@ -123,12 +88,19 @@ def run_once(config: Optional[Settings] = None) -> Dict[str, Any]:
     """执行一次端到端信号生成流程。"""
 
     cfg = config or load_settings()
+    prompt = _build_prompt(cfg)
+    logger.info("LLM prompt -> %s", prompt)
+
     gateway = CcxtGateway(cfg.exchange_id)
     agent = create_trading_agent(cfg, gateway)
 
-    response = agent.run(input=_build_prompt(cfg))
+    response = agent.run(input=prompt)
     if isinstance(response, RunOutput):
-        return _serialize_response(response, cfg)
+        serialized = _serialize_response(response, cfg)
+        logger.info("LLM raw content -> %s", serialized.get("content"))
+        logger.info("LLM parsed output -> %s", serialized.get("parsed"))
+        logger.info("Normalized signal -> %s", serialized.get("normalized"))
+        return serialized
 
-    # 理论上不会触发，兜底返回原对象
+    logger.info("Agent returned non-standard payload -> %s", response)
     return {"raw": response}
