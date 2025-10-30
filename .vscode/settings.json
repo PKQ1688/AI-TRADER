@@ -4,5 +4,8 @@
         "macd",
         "ohlcv",
         "sdist"
-    ]
+    ],
+    "terminal.integrated.env.osx": {
+        "PYTHONDONTWRITEBYTECODE": "1"
+    }
 }

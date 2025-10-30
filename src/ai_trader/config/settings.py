@@ -1,5 +1,7 @@
 """统一加载与维护运行时配置。"""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from os import getenv
 from typing import Optional

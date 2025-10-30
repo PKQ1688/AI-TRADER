@@ -3,6 +3,8 @@
 暴露高频 API，保持调用简单直接。
 """
 
+from __future__ import annotations
+
 from .agents import create_trading_agent
 from .config import Settings, load_settings
 from .orchestrator import run_once
