@@ -2,21 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, MutableSequence, Optional, List, Sequence
+from typing import Any, MutableSequence, Optional, List, Sequence
 
 from agno.agent import Agent
 from agno.models.deepseek.deepseek import DeepSeek
-from pydantic import BaseModel
 
 from ..config import Settings
 from ..data import DataGateway
 from ..indicators import build_macd_tool
-
-
-class TradingSignalSchema(BaseModel):
-    """约束模型仅输出买/卖/观望信号。"""
-
-    signal: Literal["buy", "sell", "hold"]
 
 
 def _build_instructions(settings: Settings) -> List[str]:
@@ -69,6 +62,4 @@ def create_trading_agent(
         instructions=instructions,
         dependencies={"settings": settings},
         add_dependencies_to_context=False,
-        output_schema=TradingSignalSchema,
-        use_json_mode=True,
     )
