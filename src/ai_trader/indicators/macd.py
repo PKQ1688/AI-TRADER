@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from enum import Enum
+from time import perf_counter
 from typing import Any, Dict, Iterable, Optional
 
 from agno.tools import Function
 
 from ..data import DataGateway
+from ..core.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class MacdSignal(str, Enum):
@@ -129,16 +133,35 @@ def build_macd_tool(
         target_timeframe = timeframe or default_timeframe
         target_limit = limit or default_limit
 
+        fetch_start = perf_counter()
         candles = data_gateway.fetch_ohlcv(
             target_symbol, target_timeframe, target_limit
         )
+        fetch_duration = perf_counter() - fetch_start
+        logger.info(
+            "MACD 工具获取烛线耗时 %.3fs (symbol=%s, timeframe=%s, limit=%s)",
+            fetch_duration,
+            target_symbol,
+            target_timeframe,
+            target_limit,
+        )
         closes = [candle.close for candle in candles]
 
+        macd_start = perf_counter()
         macd_line, signal_line, histogram, prev_hist = _calculate_macd(
             closes,
             fast_period=fast_period,
             slow_period=slow_period,
             signal_period=signal_period,
+        )
+        macd_duration = perf_counter() - macd_start
+        logger.info(
+            "MACD 指标计算耗时 %.3fs (candles=%s, fast=%s, slow=%s, signal=%s)",
+            macd_duration,
+            len(closes),
+            fast_period,
+            slow_period,
+            signal_period,
         )
         signal = _determine_signal(histogram, prev_hist)
 

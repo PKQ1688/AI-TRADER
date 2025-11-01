@@ -14,11 +14,24 @@ def main() -> None:
 
     normalized = result.get("normalized") or result.get("parsed") or {}
     signal = normalized.get("signal", "hold")
+    symbol = normalized.get('symbol', settings.symbol)
+    timeframe = normalized.get('timeframe', settings.timeframe)
 
-    print("== AI Trader Signal ==")
-    print(f"symbol: {normalized.get('symbol', settings.symbol)}")
-    print(f"timeframe: {normalized.get('timeframe', settings.timeframe)}")
-    print(f"signal: {signal}")
+    # 根据信号类型添加表情符号和颜色
+    signal_emoji = {
+        "buy": "🟢",
+        "sell": "🔴",
+        "hold": "🟡"
+    }
+
+    signal_desc = {
+        "buy": "买入",
+        "sell": "卖出",
+        "hold": "观望"
+    }
+
+    print(f"\n📊 {symbol} ({timeframe})")
+    print(f"{signal_emoji.get(signal, '⚪')} 交易建议: {signal_desc.get(signal, '未知')}")
 
 
 if __name__ == "__main__":

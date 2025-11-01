@@ -3,9 +3,20 @@
 from __future__ import annotations
 
 import logging
+import os
 
 # 基础日志级别
 DEFAULT_LEVEL = logging.INFO
+
+# 从环境变量读取详细级别设置
+VERBOSE_LOGGING = os.getenv("AI_TRADER_VERBOSE", "false").lower() == "true"
+DEBUG_LOGGING = os.getenv("AI_TRADER_DEBUG", "false").lower() == "true"
+
+# 根据环境变量调整日志级别
+if DEBUG_LOGGING:
+    DEFAULT_LEVEL = logging.DEBUG
+elif VERBOSE_LOGGING:
+    DEFAULT_LEVEL = logging.INFO
 
 # RichHandler 相关细节
 SHOW_PATH = False

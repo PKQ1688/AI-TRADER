@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any, Dict, List, Protocol, Sequence
 
 import ccxt
 
+from ..core.logging import get_logger
+
+logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class Candle:
@@ -47,7 +51,14 @@ class CcxtGateway:
             raise ValueError(f"不支持的交易所标识: {self.exchange_id}") from exc
 
         client = exchange_cls(self.client_config)
+        start = perf_counter()
         client.load_markets()
+        duration = perf_counter() - start
+        logger.info(
+            "CCXT load_markets 耗时 %.3fs (exchange=%s)",
+            duration,
+            self.exchange_id,
+        )
         self._client = client
         return client
 
@@ -55,8 +66,17 @@ class CcxtGateway:
         """从交易所拉取 K 线数据并转换为标准结构。"""
 
         client = self._get_client()
+        start = perf_counter()
         raw_ohlcv: List[List[Any]] = client.fetch_ohlcv(
             symbol, timeframe=timeframe, limit=limit
+        )
+        duration = perf_counter() - start
+        logger.info(
+            "fetch_ohlcv 网络耗时 %.3fs (symbol=%s, timeframe=%s, limit=%s)",
+            duration,
+            symbol,
+            timeframe,
+            limit,
         )
 
         candles: List[Candle] = []
