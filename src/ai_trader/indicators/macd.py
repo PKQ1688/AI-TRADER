@@ -5,11 +5,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from enum import Enum
 from time import perf_counter
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, MutableMapping, Optional, Sequence, Tuple
 
 from agno.tools import Function
 
-from ..data import DataGateway
+from ..data import Candle, DataGateway
 from ..core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -111,12 +111,16 @@ def _determine_signal(
     return MacdSignal.HOLD
 
 
+CandlesKey = Tuple[str, str, int]
+
+
 def build_macd_tool(
     data_gateway: DataGateway,
     *,
     default_symbol: str,
     default_timeframe: str,
     default_limit: int,
+    prefetched_candles: Optional[MutableMapping[CandlesKey, Sequence[Candle]]] = None,
 ) -> Function:
     """构造可供 Agent 调用的 MACD 工具。"""
 
@@ -133,18 +137,34 @@ def build_macd_tool(
         target_timeframe = timeframe or default_timeframe
         target_limit = limit or default_limit
 
-        fetch_start = perf_counter()
-        candles = data_gateway.fetch_ohlcv(
-            target_symbol, target_timeframe, target_limit
-        )
-        fetch_duration = perf_counter() - fetch_start
-        logger.info(
-            "MACD 工具获取烛线耗时 %.3fs (symbol=%s, timeframe=%s, limit=%s)",
-            fetch_duration,
-            target_symbol,
-            target_timeframe,
-            target_limit,
-        )
+        cache_key: CandlesKey = (target_symbol, target_timeframe, target_limit)
+        candles: Sequence[Candle]
+        candles_cache = prefetched_candles
+
+        if candles_cache is not None and cache_key in candles_cache:
+            candles = candles_cache[cache_key]
+            logger.info(
+                "MACD 工具复用预取烛线数据 (symbol=%s, timeframe=%s, limit=%s)",
+                target_symbol,
+                target_timeframe,
+                target_limit,
+            )
+        else:
+            fetch_start = perf_counter()
+            candles = data_gateway.fetch_ohlcv(
+                target_symbol, target_timeframe, target_limit
+            )
+            fetch_duration = perf_counter() - fetch_start
+            logger.info(
+                "MACD 工具获取烛线耗时 %.3fs (symbol=%s, timeframe=%s, limit=%s)",
+                fetch_duration,
+                target_symbol,
+                target_timeframe,
+                target_limit,
+            )
+            if candles_cache is not None:
+                candles_cache[cache_key] = candles
+
         closes = [candle.close for candle in candles]
 
         macd_start = perf_counter()

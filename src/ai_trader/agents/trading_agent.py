@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, MutableSequence, Optional, List, Sequence
+from typing import Any, List, MutableMapping, MutableSequence, Optional, Sequence, Tuple
 
 from agno.agent import Agent
 from agno.models.deepseek.deepseek import DeepSeek
 
 from ..config import Settings
-from ..data import DataGateway
+from ..data import Candle, DataGateway
 from ..indicators import build_macd_tool
 
 
@@ -38,6 +38,9 @@ def create_trading_agent(
     settings: Settings,
     data_gateway: DataGateway,
     tools: Optional[Sequence[Any]] = None,
+    prefetched_candles: Optional[
+        MutableMapping[Tuple[str, str, int], Sequence[Candle]]
+    ] = None,
 ) -> Agent:
     """创建最小可用的交易 Agent。"""
 
@@ -48,6 +51,7 @@ def create_trading_agent(
             default_symbol=settings.symbol,
             default_timeframe=settings.timeframe,
             default_limit=settings.candle_limit,
+            prefetched_candles=prefetched_candles,
         )
     )
 

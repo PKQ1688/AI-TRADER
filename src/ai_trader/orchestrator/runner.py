@@ -5,13 +5,13 @@ from __future__ import annotations
 import ast
 import json
 from time import perf_counter
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from agno.run.agent import RunOutput
 
 from ..agents import create_trading_agent
 from ..config import Settings, load_settings
-from ..data import CcxtGateway
+from ..data import Candle, CcxtGateway
 from ..core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -206,7 +206,10 @@ def run_once(config: Optional[Settings] = None) -> Dict[str, Any]:
     logger.info("开始分析 %s (%s)", cfg.symbol, cfg.timeframe)
 
     gateway_start = perf_counter()
-    gateway = CcxtGateway(cfg.exchange_id)
+    gateway = CcxtGateway(
+        cfg.exchange_id,
+        client_config={"skip_load_markets": True},
+    )
     gateway_duration = perf_counter() - gateway_start
     logger.info(
         "CcxtGateway 初始化耗时 %.3fs (exchange=%s)",
@@ -214,8 +217,27 @@ def run_once(config: Optional[Settings] = None) -> Dict[str, Any]:
         cfg.exchange_id,
     )
 
+    prefetch_start = perf_counter()
+    candles = gateway.fetch_ohlcv(cfg.symbol, cfg.timeframe, cfg.candle_limit)
+    prefetch_duration = perf_counter() - prefetch_start
+    logger.info(
+        "预取烛线耗时 %.3fs (symbol=%s, timeframe=%s, limit=%s, candles=%s)",
+        prefetch_duration,
+        cfg.symbol,
+        cfg.timeframe,
+        cfg.candle_limit,
+        len(candles),
+    )
+    cached_candles: Dict[Tuple[str, str, int], Sequence[Candle]] = {
+        (cfg.symbol, cfg.timeframe, cfg.candle_limit): candles
+    }
+
     agent_start = perf_counter()
-    agent = create_trading_agent(cfg, gateway)
+    agent = create_trading_agent(
+        cfg,
+        gateway,
+        prefetched_candles=cached_candles,
+    )
     agent_duration = perf_counter() - agent_start
     logger.info("TradingAgent 构建耗时 %.3fs", agent_duration)
 

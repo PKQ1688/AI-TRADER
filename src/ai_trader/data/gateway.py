@@ -50,15 +50,25 @@ class CcxtGateway:
         except AttributeError as exc:
             raise ValueError(f"不支持的交易所标识: {self.exchange_id}") from exc
 
-        client = exchange_cls(self.client_config)
-        start = perf_counter()
-        client.load_markets()
-        duration = perf_counter() - start
-        logger.info(
-            "CCXT load_markets 耗时 %.3fs (exchange=%s)",
-            duration,
-            self.exchange_id,
-        )
+        client_config = dict(self.client_config)
+        skip_load_markets = bool(client_config.pop("skip_load_markets", False))
+
+        client = exchange_cls(client_config)
+
+        if not skip_load_markets:
+            start = perf_counter()
+            client.load_markets()
+            duration = perf_counter() - start
+            logger.info(
+                "CCXT load_markets 耗时 %.3fs (exchange=%s)",
+                duration,
+                self.exchange_id,
+            )
+        else:
+            logger.info(
+                "skip_load_markets 启用，跳过 load_markets 调用 (exchange=%s)",
+                self.exchange_id,
+            )
         self._client = client
         return client
 
