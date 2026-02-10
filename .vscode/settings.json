@@ -1,8 +1,10 @@
 {
     "cSpell.words": [
         "ccxt",
+        "envrc",
         "macd",
         "ohlcv",
+        "pycache",
         "sdist"
     ],
     "terminal.integrated.env.osx": {
