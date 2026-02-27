@@ -1,4 +1,17 @@
 __pycache__/
+*.py[cod]
 
 .env
 .envrc
+
+.venv/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+.DS_Store
+
+data/raw/
+outputs/
