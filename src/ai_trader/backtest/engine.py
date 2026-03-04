@@ -60,8 +60,17 @@ def _top_signal(signals: list[Signal], signal_types: set[str], min_confidence: f
     return candidates[0]
 
 
+def _short_entry_types(chan_config) -> set[str]:
+    configured = set(chan_config.execution_sell_types)
+    if configured:
+        return configured
+    return set(chan_config.execution_reduce_types)
+
+
 def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bars_sub: list[Bar] | None = None) -> BacktestReport:
     chan_config = get_chan_config(config.chan_mode)
+    short_entry_types = _short_entry_types(chan_config)
+    short_entry_min_conf = max(config.min_confidence, chan_config.execution_reduce_min_confidence)
 
     if bars_main is None:
         bars_main = load_ohlcv(
@@ -244,87 +253,134 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
         if recovery_positive_needed > 0:
             size_multiplier = min(size_multiplier, 0.5)
 
-        # 先处理平仓/减仓（t信号，t+1开盘执行）
-        should_sell = False
-        should_reduce = False
+        buy_signal = _top_signal(decision.signals, {"B2", "B3"}, config.min_confidence)
         sell_signal = _top_signal(decision.signals, {"S2", "S3"}, config.min_confidence)
+        short_signal = _top_signal(decision.signals, short_entry_types, short_entry_min_conf)
+
+        # 先处理平仓/减仓（t信号，t+1开盘执行）
+        should_close = False
+        should_reduce = False
 
         if position_qty > 0:
             if position_stop_price is not None and bar.close <= position_stop_price:
-                should_sell = True
+                should_close = True
             elif decision.action.decision == "sell" or sell_signal is not None:
-                should_sell = True
+                should_close = True
             elif decision.action.decision == "reduce":
                 should_reduce = True
+        elif position_qty < 0:
+            if position_stop_price is not None and bar.close >= position_stop_price:
+                should_close = True
+            elif decision.action.decision == "buy" or buy_signal is not None:
+                should_close = True
 
-        if position_qty > 0 and (should_sell or should_reduce):
-            qty_to_sell = position_qty if should_sell else position_qty * 0.5
-            sell_price = next_bar.open * (1 - config.slippage_rate)
-            proceeds = qty_to_sell * sell_price
-            exit_fee = proceeds * config.fee_rate
-            cash += proceeds - exit_fee
+        if position_qty != 0 and (should_close or should_reduce):
+            is_long = position_qty > 0
+            qty_before = abs(position_qty)
+            qty_to_close = qty_before if should_close else qty_before * 0.5
+            if qty_to_close <= 0:
+                qty_to_close = 0.0
 
-            qty_before = position_qty
-            alloc_entry_fee = position_entry_fee * (qty_to_sell / qty_before) if qty_before > 0 else 0.0
-            gross_pnl = (sell_price - position_entry_price) * qty_to_sell
+            alloc_entry_fee = position_entry_fee * (qty_to_close / qty_before) if qty_before > 0 else 0.0
+
+            if is_long:
+                exit_price = next_bar.open * (1 - config.slippage_rate)
+                proceeds = qty_to_close * exit_price
+                exit_fee = proceeds * config.fee_rate
+                cash += proceeds - exit_fee
+                gross_pnl = (exit_price - position_entry_price) * qty_to_close
+                side = "long"
+                slippage_cost = qty_to_close * next_bar.open * config.slippage_rate
+            else:
+                exit_price = next_bar.open * (1 + config.slippage_rate)
+                cover_cost = qty_to_close * exit_price
+                exit_fee = cover_cost * config.fee_rate
+                cash -= cover_cost + exit_fee
+                gross_pnl = (position_entry_price - exit_price) * qty_to_close
+                side = "short"
+                slippage_cost = qty_to_close * next_bar.open * config.slippage_rate
+
             net_pnl = gross_pnl - alloc_entry_fee - exit_fee
-            notional = position_entry_price * qty_to_sell
+            notional = position_entry_price * qty_to_close
             net_return = net_pnl / notional if notional > 0 else 0.0
 
             if position_signal_index >= 0 and position_signal_index + 3 < len(bars_main):
                 entry_idx = position_signal_index + 1
                 exit_idx = position_signal_index + 3
                 fwd_entry = bars_main[entry_idx].open
-                forward_return = (bars_main[exit_idx].close - fwd_entry) / fwd_entry if fwd_entry > 0 else 0.0
+                forward_long = (bars_main[exit_idx].close - fwd_entry) / fwd_entry if fwd_entry > 0 else 0.0
+                forward_return = forward_long if is_long else -forward_long
             else:
                 forward_return = 0.0
 
-            benchmark_return = _pick_benchmark_return(rng, year_returns, next_bar.time.year)
+            benchmark_long = _pick_benchmark_return(rng, year_returns, next_bar.time.year)
+            benchmark_return = benchmark_long if is_long else -benchmark_long
             trades.append(
                 Trade(
-                    side="long",
+                    side=side,
                     signal_type=position_signal_type,  # type: ignore[arg-type]
                     entry_time=position_entry_time or next_bar.time,
                     exit_time=next_bar.time,
                     entry_price=position_entry_price,
-                    exit_price=sell_price,
-                    quantity=qty_to_sell,
+                    exit_price=exit_price,
+                    quantity=qty_to_close,
                     gross_pnl=gross_pnl,
                     net_pnl=net_pnl,
                     net_return=net_return,
                     fees=alloc_entry_fee + exit_fee,
-                    slippage_cost=qty_to_sell * next_bar.open * config.slippage_rate,
+                    slippage_cost=slippage_cost,
                     forward_3bar_return=forward_return,
                     benchmark_return=benchmark_return,
                 )
             )
 
-            position_qty -= qty_to_sell
             position_entry_fee -= alloc_entry_fee
+            if position_entry_fee < 0:
+                position_entry_fee = 0.0
 
-            if should_sell or position_qty <= 0:
+            remaining_qty = qty_before - qty_to_close
+            if should_close or remaining_qty <= 0:
                 position_qty = 0.0
                 position_entry_price = 0.0
                 position_entry_fee = 0.0
                 position_entry_time = None
                 position_signal_index = -1
                 position_stop_price = None
+            else:
+                position_qty = remaining_qty if is_long else -remaining_qty
 
             if trades and trades[-1].net_pnl > 0 and recovery_positive_needed > 0:
                 recovery_positive_needed -= 1
 
         # 再处理开仓
-        buy_signal = _top_signal(decision.signals, {"B2", "B3"}, config.min_confidence)
-        can_open = (
-            position_qty <= 0
+        can_open_long = (
+            position_qty == 0
             and size_multiplier > 0
             and decision.action.decision == "buy"
             and buy_signal is not None
             and decision.risk.conflict_level != "high"
             and decision.data_quality.status == "ok"
         )
+        can_open_short = (
+            position_qty == 0
+            and size_multiplier > 0
+            and short_signal is not None
+            and decision.risk.conflict_level != "high"
+            and decision.data_quality.status == "ok"
+        )
 
-        if can_open:
+        entry_side = ""
+        if can_open_long and can_open_short and buy_signal is not None and short_signal is not None:
+            if buy_signal.confidence > short_signal.confidence:
+                entry_side = "long"
+            elif short_signal.confidence > buy_signal.confidence:
+                entry_side = "short"
+        elif can_open_long:
+            entry_side = "long"
+        elif can_open_short:
+            entry_side = "short"
+
+        if entry_side == "long" and buy_signal is not None:
             buy_price = next_bar.open * (1 + config.slippage_rate)
             alloc_cash = cash * size_multiplier / (1 + config.fee_rate)
             if alloc_cash > 0 and buy_price > 0:
@@ -339,6 +395,21 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
                 position_signal_type = buy_signal.type
                 position_signal_index = i
                 position_stop_price = buy_signal.invalid_price
+        elif entry_side == "short" and short_signal is not None:
+            sell_price = next_bar.open * (1 - config.slippage_rate)
+            alloc_notional = cash * size_multiplier / (1 + config.fee_rate)
+            if alloc_notional > 0 and sell_price > 0:
+                quantity = alloc_notional / sell_price
+                entry_fee = alloc_notional * config.fee_rate
+                cash += alloc_notional - entry_fee
+
+                position_qty = -quantity
+                position_entry_price = sell_price
+                position_entry_fee = entry_fee
+                position_entry_time = next_bar.time
+                position_signal_type = short_signal.type
+                position_signal_index = i
+                position_stop_price = short_signal.invalid_price
 
     # 最后一个bar补权益
     if bars_main:

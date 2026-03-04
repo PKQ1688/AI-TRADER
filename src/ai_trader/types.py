@@ -270,7 +270,7 @@ class ChanSnapshot:
 
 @dataclass(slots=True)
 class Trade:
-    side: Literal["long"]
+    side: Literal["long", "short"]
     signal_type: SignalType
     entry_time: datetime
     exit_time: datetime
