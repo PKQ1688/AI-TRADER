@@ -105,6 +105,37 @@ uv run python scripts/run_chan_diagnostic.py \
 - `zhongshus_main.csv` / `zhongshus_sub.csv`
 - `summary.md`（可读摘要）
 
+## 视觉复核（OpenAI 兼容 `chat/completions`）
+
+先准备一个诊断目录，再提供一张或多张图表截图给视觉模型复核。
+
+推荐通过环境变量注入配置：
+
+```bash
+export AI_TRADER_OPENAI_BASE_URL=https://www.packyapi.com
+export AI_TRADER_OPENAI_MODEL=gpt-5.4
+export AI_TRADER_OPENAI_API_KEY=your_api_key
+```
+
+运行示例：
+
+```bash
+uv run python scripts/run_chan_vlm_review.py \
+  --diagnostic-dir outputs/diagnostics/BTCUSDT_4h_1h/<run_id> \
+  --image /absolute/path/to/chart-main.png \
+  --image /absolute/path/to/chart-sub.png
+```
+
+输出目录示例：
+
+`outputs/vision_reviews/BTCUSDT_4h_1h/<run_id>/`
+
+包含：
+
+- `review_input.json`（发送前的结构化上下文和请求元数据，不含 API key）
+- `review_response.json`（模型原始返回）
+- `summary.md`（可读摘要）
+
 ## Kline8 对齐审计
 
 按整段历史逐根回放，逐条校验 `B1/B2/B3/S1/S2/S3` 的结构条件和动作约束：
