@@ -1,5 +1,5 @@
 from .buy_sell_points import decide_action, generate_signals
-from .center import build_zhongshus
+from .center import build_zhongshus, build_zhongshus_from_bis
 from .divergence import detect_divergence_candidates
 from .fractal import detect_fractals
 from .include import merge_inclusions
@@ -11,6 +11,7 @@ __all__ = [
     "build_bis",
     "build_segments",
     "build_zhongshus",
+    "build_zhongshus_from_bis",
     "decide_action",
     "detect_divergence_candidates",
     "detect_fractals",

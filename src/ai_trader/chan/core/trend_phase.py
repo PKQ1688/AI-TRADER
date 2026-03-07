@@ -3,12 +3,16 @@ from __future__ import annotations
 from ai_trader.types import Bi, MarketState, Segment, TrendType, Zhongshu
 
 
-def infer_trend_type(last_price: float, bis: list[Bi], zhongshus: list[Zhongshu]) -> TrendType:
+def infer_trend_type(
+    last_price: float, bis: list[Bi], zhongshus: list[Zhongshu]
+) -> TrendType:
     if len(zhongshus) >= 2:
         prev, cur = zhongshus[-2], zhongshus[-1]
-        if cur.dd > prev.gg:
+        # kline8-18: trend is determined by non-overlapping 中枢区间 (zd/zg),
+        # NOT the oscillation range (dd/gg) which is too strict.
+        if cur.zd > prev.zg:
             return "up"
-        if cur.gg < prev.dd:
+        if cur.zg < prev.zd:
             return "down"
 
     if zhongshus and bis:
@@ -29,10 +33,18 @@ def infer_market_state(
     zhongshus: list[Zhongshu],
 ) -> MarketState:
     trend_type = infer_trend_type(bars_close, bis, zhongshus)
-    walk_type = "trend" if len(zhongshus) >= 2 and trend_type in {"up", "down"} else "consolidation"
+    walk_type = (
+        "trend"
+        if len(zhongshus) >= 2 and trend_type in {"up", "down"}
+        else "consolidation"
+    )
 
     phase = "trending" if walk_type == "trend" else "consolidating"
-    if trend_type == "range" and len(segments) >= 2 and segments[-1].direction != segments[-2].direction:
+    if (
+        trend_type == "range"
+        and len(segments) >= 2
+        and segments[-1].direction != segments[-2].direction
+    ):
         phase = "transitional"
 
     last_zs = zhongshus[-1] if zhongshus else None

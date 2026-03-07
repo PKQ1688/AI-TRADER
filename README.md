@@ -70,11 +70,11 @@ uv run python -m unittest discover -s tests -p "test_*.py"
 
 信号会完整输出，但动作层默认执行保守过滤：
 
-- 买入：仅使用 `B3`，且 `confidence >= 0.65`
+- 买入：使用 `B2/B3`，且 `confidence >= 0.65`
 - 买入冲突约束：`conflict_level` 不能为 `high`
 - 中阴阶段：默认 `wait`；仅出现明确三类点（`B3/S3`）才允许突破默认等待
-- 减仓：仅使用 `S3`，且默认只在 `conflict_level=high` 时触发
-- `B2/S2` 默认作为观察信号保留输出，不直接触发交易动作（`pragmatic` 模式可放宽）
+- 减仓：使用 `S2/S3`，且默认只在 `conflict_level=high` 时触发
+- `strict_kline8` 仍以保守确认和高冲突约束为主，不直接把减仓信号当作开空信号
 
 ## 结构诊断（真实 BTC 行情）
 
@@ -104,6 +104,32 @@ uv run python scripts/run_chan_diagnostic.py \
 - `segments_main.csv` / `segments_sub.csv`
 - `zhongshus_main.csv` / `zhongshus_sub.csv`
 - `summary.md`（可读摘要）
+
+## 逐 Bar 结构回放
+
+用于按主级别 K 线逐根回放，输出每根 bar 的 market state、signals、action，方便人工对照盘感检查。
+
+```bash
+uv run python scripts/run_chan_replay.py \
+  --exchange binance \
+  --symbol BTC/USDT \
+  --timeframe-main 4h \
+  --timeframe-sub 1h \
+  --start 2024-01-01T00:00:00Z \
+  --end 2024-06-30T23:59:59Z \
+  --tail-bars 30
+```
+
+输出目录示例：
+
+`outputs/replays/BTCUSDT_4h_1h/<run_id>/`
+
+包含：
+
+- `replay_rows.csv`（每根主级别 bar 的完整回放明细）
+- `focus_rows.csv`（有信号或非 `hold/wait` 动作的重点 bar）
+- `summary.json`
+- `summary.md`
 
 ## 视觉复核（OpenAI 兼容 `chat/completions`）
 

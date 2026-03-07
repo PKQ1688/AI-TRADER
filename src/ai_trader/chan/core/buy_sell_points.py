@@ -4,7 +4,7 @@ from typing import Iterable
 
 from ai_trader.chan.config import ChanConfig
 from ai_trader.chan.core.divergence import DivergenceCandidate
-from ai_trader.types import Action, Bi, MarketState, Risk, Signal, Zhongshu
+from ai_trader.types import Action, Bi, MarketState, Risk, Segment, Signal, Zhongshu
 
 
 def _clamp01(v: float) -> float:
@@ -19,103 +19,185 @@ def _apply_phase_cap(signal_type: str, confidence: float, phase: str, cap: float
     return min(confidence, cap)
 
 
-def _derive_b2(b1: Signal, bis_sub: list[Bi]) -> Signal | None:
-    if len(bis_sub) < 2:
-        return None
-    prev_bi, cur_bi = bis_sub[-2], bis_sub[-1]
-    if not (prev_bi.direction == "down" and cur_bi.direction == "up"):
+def _confirmed_bis_after(bis_sub: list[Bi], anchor_time) -> list[Bi]:
+    return [item for item in bis_sub if item.status == "confirmed" and item.available_time > anchor_time]
+
+
+def _confirmed_segments(segments_sub: list[Segment]) -> list[Segment]:
+    return [item for item in segments_sub if item.status == "confirmed"]
+
+
+def _segment_overlaps_center(segment: Segment, zhongshu: Zhongshu) -> bool:
+    return segment.high >= zhongshu.zd and segment.low <= zhongshu.zg
+
+
+def _first_retrace_confirmation(
+    bis_sub: list[Bi],
+    anchor_time,
+    departure_direction: str,
+    retrace_direction: str,
+) -> tuple[Bi, Bi] | None:
+    post = _confirmed_bis_after(bis_sub, anchor_time)
+    if len(post) < 2:
         return None
 
+    saw_departure = False
+    for idx, item in enumerate(post):
+        if item.direction == departure_direction:
+            saw_departure = True
+            continue
+        if not saw_departure or item.direction != retrace_direction:
+            continue
+        if idx + 1 >= len(post):
+            return None
+        confirm = post[idx + 1]
+        if confirm.direction != departure_direction:
+            return None
+        return item, confirm
+
+    return None
+
+
+def _derive_b2(b1: Signal, bis_sub: list[Bi]) -> Signal | None:
+    sequence = _first_retrace_confirmation(
+        bis_sub=bis_sub,
+        anchor_time=b1.available_time,
+        departure_direction="up",
+        retrace_direction="down",
+    )
+    if sequence is None:
+        return None
+    retrace_bi, confirm_bi = sequence
+
     invalid_price = b1.invalid_price
-    if invalid_price is not None and prev_bi.low <= invalid_price:
+    if invalid_price is not None and retrace_bi.low <= invalid_price:
         return None
 
     return Signal(
         type="B2",
         level="sub",
-        trigger="一买后次级别回抽不破一买低点并重新转强",
+        trigger="一买后次级别首次回抽不破一买低点，并再次转强",
         invalid_if=b1.invalid_if,
         confidence=_clamp01(b1.confidence + 0.12),
-        event_time=cur_bi.event_time,
-        available_time=cur_bi.available_time,
+        event_time=confirm_bi.event_time,
+        available_time=confirm_bi.available_time,
         invalid_price=b1.invalid_price,
     )
 
 
 def _derive_s2(s1: Signal, bis_sub: list[Bi]) -> Signal | None:
-    if len(bis_sub) < 2:
+    sequence = _first_retrace_confirmation(
+        bis_sub=bis_sub,
+        anchor_time=s1.available_time,
+        departure_direction="down",
+        retrace_direction="up",
+    )
+    if sequence is None:
         return None
-    prev_bi, cur_bi = bis_sub[-2], bis_sub[-1]
-    if not (prev_bi.direction == "up" and cur_bi.direction == "down"):
-        return None
+    retrace_bi, confirm_bi = sequence
 
     invalid_price = s1.invalid_price
-    if invalid_price is not None and prev_bi.high >= invalid_price:
+    if invalid_price is not None and retrace_bi.high >= invalid_price:
         return None
 
     return Signal(
         type="S2",
         level="sub",
-        trigger="一卖后次级别反抽不破一卖高点并重新转弱",
+        trigger="一卖后次级别首次反抽不破一卖高点，并再次转弱",
         invalid_if=s1.invalid_if,
         confidence=_clamp01(s1.confidence + 0.12),
-        event_time=cur_bi.event_time,
-        available_time=cur_bi.available_time,
+        event_time=confirm_bi.event_time,
+        available_time=confirm_bi.available_time,
         invalid_price=s1.invalid_price,
     )
 
 
-def _derive_b3(bars_close: float, bis_main: list[Bi], zhongshu: Zhongshu | None) -> Signal | None:
-    if zhongshu is None or not bis_main:
+def _derive_b3(segments_sub: list[Segment], zhongshu: Zhongshu | None) -> Signal | None:
+    if zhongshu is None:
         return None
 
-    last_bi = bis_main[-1]
-    if not (last_bi.direction == "up" and bars_close > zhongshu.zg):
+    confirmed = _confirmed_segments(segments_sub)
+    if len(confirmed) < 2:
         return None
 
-    if len(bis_main) >= 2 and bis_main[-2].direction == "down" and bis_main[-2].low <= zhongshu.zg:
+    for pullback_idx in range(len(confirmed) - 1, 0, -1):
+        pullback = confirmed[pullback_idx]
+        if pullback.direction != "down" or pullback.low <= zhongshu.zg:
+            continue
+
+        departure_end_idx = pullback_idx - 1
+        departure_end = confirmed[departure_end_idx]
+        if departure_end.direction != "up" or departure_end.high <= zhongshu.zg:
+            continue
+
+        departure_start_idx = departure_end_idx
+        while departure_start_idx > 0 and confirmed[departure_start_idx - 1].direction == "up":
+            departure_start_idx -= 1
+
+        overlap_idx = departure_start_idx - 1
+        if overlap_idx < 0 or not _segment_overlaps_center(confirmed[overlap_idx], zhongshu):
+            continue
+
+        available_time = max(pullback.available_time, zhongshu.available_time)
+        return Signal(
+            type="B3",
+            level="main",
+            trigger="次级别向上离开中枢后，首次回抽未重新进入中枢",
+            invalid_if=f"价格跌回中枢上沿{zhongshu.zg:.2f}下方",
+            confidence=0.68,
+            event_time=pullback.event_time,
+            available_time=available_time,
+            invalid_price=zhongshu.zg,
+        )
+
+    return None
+
+
+def _derive_s3(segments_sub: list[Segment], zhongshu: Zhongshu | None) -> Signal | None:
+    if zhongshu is None:
         return None
 
-    return Signal(
-        type="B3",
-        level="main",
-        trigger="向上离开中枢后首次回抽不回中枢并恢复上行",
-        invalid_if=f"价格跌回中枢上沿{zhongshu.zg:.2f}下方",
-        confidence=0.68,
-        event_time=last_bi.event_time,
-        available_time=last_bi.available_time,
-        invalid_price=zhongshu.zg,
-    )
-
-
-def _derive_s3(bars_close: float, bis_main: list[Bi], zhongshu: Zhongshu | None) -> Signal | None:
-    if zhongshu is None or not bis_main:
+    confirmed = _confirmed_segments(segments_sub)
+    if len(confirmed) < 2:
         return None
 
-    last_bi = bis_main[-1]
-    if not (last_bi.direction == "down" and bars_close < zhongshu.zd):
-        return None
+    for pullback_idx in range(len(confirmed) - 1, 0, -1):
+        pullback = confirmed[pullback_idx]
+        if pullback.direction != "up" or pullback.high >= zhongshu.zd:
+            continue
 
-    if len(bis_main) >= 2 and bis_main[-2].direction == "up" and bis_main[-2].high >= zhongshu.zd:
-        return None
+        departure_end_idx = pullback_idx - 1
+        departure_end = confirmed[departure_end_idx]
+        if departure_end.direction != "down" or departure_end.low >= zhongshu.zd:
+            continue
 
-    return Signal(
-        type="S3",
-        level="main",
-        trigger="向下离开中枢后首次反抽不回中枢并继续下行",
-        invalid_if=f"价格重新站回中枢下沿{zhongshu.zd:.2f}上方",
-        confidence=0.68,
-        event_time=last_bi.event_time,
-        available_time=last_bi.available_time,
-        invalid_price=zhongshu.zd,
-    )
+        departure_start_idx = departure_end_idx
+        while departure_start_idx > 0 and confirmed[departure_start_idx - 1].direction == "down":
+            departure_start_idx -= 1
+
+        overlap_idx = departure_start_idx - 1
+        if overlap_idx < 0 or not _segment_overlaps_center(confirmed[overlap_idx], zhongshu):
+            continue
+
+        available_time = max(pullback.available_time, zhongshu.available_time)
+        return Signal(
+            type="S3",
+            level="main",
+            trigger="次级别向下离开中枢后，首次反抽未重新进入中枢",
+            invalid_if=f"价格重新站回中枢下沿{zhongshu.zd:.2f}上方",
+            confidence=0.68,
+            event_time=pullback.event_time,
+            available_time=available_time,
+            invalid_price=zhongshu.zd,
+        )
+
+    return None
 
 
 def generate_signals(
     divergence_candidates: list[DivergenceCandidate],
-    bis_main: list[Bi],
     bis_sub: list[Bi],
-    bars_close: float,
+    segments_sub: list[Segment],
     zhongshu_main: Zhongshu | None,
     market_state: MarketState,
     macd_missing: bool,
@@ -150,11 +232,11 @@ def generate_signals(
         if s2 is not None:
             signals.append(s2)
 
-    b3 = _derive_b3(bars_close, bis_main, zhongshu_main)
+    b3 = _derive_b3(segments_sub, zhongshu_main)
     if b3 is not None:
         signals.append(b3)
 
-    s3 = _derive_s3(bars_close, bis_main, zhongshu_main)
+    s3 = _derive_s3(segments_sub, zhongshu_main)
     if s3 is not None:
         signals.append(s3)
 

@@ -3,9 +3,12 @@
         "backtest",
         "ccxt",
         "envrc",
+        "htmlcov",
         "macd",
+        "mypy",
         "ohlcv",
         "pycache",
+        "pytest",
         "sdist"
     ],
     "terminal.integrated.env.osx": {

@@ -22,6 +22,23 @@ def _has_three_overlap(b1: Bi, b2: Bi, b3: Bi) -> bool:
     return low <= high
 
 
+def _directional_start(b1: Bi, b2: Bi, b3: Bi) -> bool:
+    """Fallback for strong trends: if the three bis do NOT overlap but form
+    a clear directional sequence, allow them to start a segment.
+
+    In a strong uptrend successive down-bis may not retrace enough to
+    overlap, yet a segment clearly exists.  We accept the start when:
+    - b1 and b3 share the same direction, and
+    - that direction is consistent with the price movement (higher highs
+      for up, lower lows for down).
+    """
+    if b1.direction != b3.direction:
+        return False
+    if b1.direction == "up":
+        return b3.high > b1.high and b3.low > b1.low
+    return b3.low < b1.low and b3.high < b1.high
+
+
 def _merge_feature_bars(bars: list[FeatureBar]) -> list[FeatureBar]:
     if len(bars) < 2:
         return bars[:]
@@ -31,7 +48,9 @@ def _merge_feature_bars(bars: list[FeatureBar]) -> list[FeatureBar]:
 
     for cur in bars[1:]:
         prev = merged[-1]
-        include = (prev.high >= cur.high and prev.low <= cur.low) or (prev.high <= cur.high and prev.low >= cur.low)
+        include = (prev.high >= cur.high and prev.low <= cur.low) or (
+            prev.high <= cur.high and prev.low >= cur.low
+        )
         if not include:
             if cur.high > prev.high and cur.low > prev.low:
                 direction = 1
@@ -56,7 +75,9 @@ def _merge_feature_bars(bars: list[FeatureBar]) -> list[FeatureBar]:
             high = min(prev.high, cur.high)
             low = min(prev.low, cur.low)
 
-        merged[-1] = FeatureBar(high=high, low=low, source_idx=prev.source_idx + cur.source_idx)
+        merged[-1] = FeatureBar(
+            high=high, low=low, source_idx=prev.source_idx + cur.source_idx
+        )
 
     return merged
 
@@ -64,8 +85,18 @@ def _merge_feature_bars(bars: list[FeatureBar]) -> list[FeatureBar]:
 def _find_feature_fractal(std: list[FeatureBar], want: str) -> int | None:
     for i in range(1, len(std) - 1):
         left, mid, right = std[i - 1], std[i], std[i + 1]
-        is_top = mid.high > left.high and mid.high > right.high and mid.low > left.low and mid.low > right.low
-        is_bottom = mid.low < left.low and mid.low < right.low and mid.high < left.high and mid.high < right.high
+        is_top = (
+            mid.high > left.high
+            and mid.high > right.high
+            and mid.low > left.low
+            and mid.low > right.low
+        )
+        is_bottom = (
+            mid.low < left.low
+            and mid.low < right.low
+            and mid.high < left.high
+            and mid.high < right.high
+        )
         if want == "top" and is_top:
             return i
         if want == "bottom" and is_bottom:
@@ -146,14 +177,19 @@ def _find_segment_end(
     return None, None
 
 
-def build_segments(bis: list[Bi], require_case2_confirmation: bool = True) -> list[Segment]:
+def build_segments(
+    bis: list[Bi], require_case2_confirmation: bool = True
+) -> list[Segment]:
     segments: list[Segment] = []
     if len(bis) < 3:
         return segments
 
     cursor = 0
     while cursor + 2 < len(bis):
-        if not _has_three_overlap(bis[cursor], bis[cursor + 1], bis[cursor + 2]):
+        if not (
+            _has_three_overlap(bis[cursor], bis[cursor + 1], bis[cursor + 2])
+            or _directional_start(bis[cursor], bis[cursor + 1], bis[cursor + 2])
+        ):
             cursor += 1
             continue
 

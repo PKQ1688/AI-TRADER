@@ -257,6 +257,7 @@ class ChanSnapshot:
     bis_sub: list[Bi]
     segments_main: list[Segment]
     segments_sub: list[Segment]
+    previous_main_bar_time: datetime | None = None
     zhongshus_main: list[Zhongshu] = field(default_factory=list)
     zhongshus_sub: list[Zhongshu] = field(default_factory=list)
     last_zhongshu_main: Zhongshu | None = None
@@ -266,6 +267,8 @@ class ChanSnapshot:
 
     def __post_init__(self) -> None:
         self.asof_time = parse_utc_time(self.asof_time)
+        if self.previous_main_bar_time is not None:
+            self.previous_main_bar_time = parse_utc_time(self.previous_main_bar_time)
 
 
 @dataclass(slots=True)

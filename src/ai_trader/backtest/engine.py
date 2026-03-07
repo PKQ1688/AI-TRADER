@@ -53,6 +53,8 @@ def _pick_benchmark_return(rng: random.Random, year_returns: dict[int, list[floa
 
 
 def _top_signal(signals: list[Signal], signal_types: set[str], min_confidence: float) -> Signal | None:
+    if not signal_types:
+        return None
     candidates = [item for item in signals if item.type in signal_types and item.confidence >= min_confidence]
     if not candidates:
         return None
@@ -60,17 +62,12 @@ def _top_signal(signals: list[Signal], signal_types: set[str], min_confidence: f
     return candidates[0]
 
 
-def _short_entry_types(chan_config) -> set[str]:
-    configured = set(chan_config.execution_sell_types)
-    if configured:
-        return configured
-    return set(chan_config.execution_reduce_types)
-
-
 def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bars_sub: list[Bar] | None = None) -> BacktestReport:
     chan_config = get_chan_config(config.chan_mode)
-    short_entry_types = _short_entry_types(chan_config)
-    short_entry_min_conf = max(config.min_confidence, chan_config.execution_reduce_min_confidence)
+    buy_entry_types = set(chan_config.execution_buy_types)
+    sell_entry_types = set(chan_config.execution_sell_types)
+    buy_entry_min_conf = max(config.min_confidence, chan_config.execution_buy_min_confidence)
+    sell_entry_min_conf = max(config.min_confidence, chan_config.execution_reduce_min_confidence)
 
     if bars_main is None:
         bars_main = load_ohlcv(
@@ -119,6 +116,7 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
     position_signal_type = "B2"
     position_signal_index = -1
     position_stop_price: float | None = None
+    last_reduce_signal_time = None
 
     frozen = False
     freeze_start = None
@@ -253,9 +251,13 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
         if recovery_positive_needed > 0:
             size_multiplier = min(size_multiplier, 0.5)
 
-        buy_signal = _top_signal(decision.signals, {"B2", "B3"}, config.min_confidence)
-        sell_signal = _top_signal(decision.signals, {"S2", "S3"}, config.min_confidence)
-        short_signal = _top_signal(decision.signals, short_entry_types, short_entry_min_conf)
+        buy_signal = _top_signal(decision.signals, buy_entry_types, buy_entry_min_conf)
+        reduce_signal = _top_signal(
+            decision.signals,
+            set(chan_config.execution_reduce_types),
+            max(config.min_confidence, chan_config.execution_reduce_min_confidence),
+        )
+        sell_signal = _top_signal(decision.signals, sell_entry_types, sell_entry_min_conf)
 
         # 先处理平仓/减仓（t信号，t+1开盘执行）
         should_close = False
@@ -264,14 +266,18 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
         if position_qty > 0:
             if position_stop_price is not None and bar.close <= position_stop_price:
                 should_close = True
-            elif decision.action.decision == "sell" or sell_signal is not None:
+            elif decision.action.decision == "sell":
                 should_close = True
-            elif decision.action.decision == "reduce":
+            elif (
+                decision.action.decision == "reduce"
+                and reduce_signal is not None
+                and reduce_signal.available_time != last_reduce_signal_time
+            ):
                 should_reduce = True
         elif position_qty < 0:
             if position_stop_price is not None and bar.close >= position_stop_price:
                 should_close = True
-            elif decision.action.decision == "buy" or buy_signal is not None:
+            elif decision.action.decision == "buy":
                 should_close = True
 
         if position_qty != 0 and (should_close or should_reduce):
@@ -346,8 +352,11 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
                 position_entry_time = None
                 position_signal_index = -1
                 position_stop_price = None
+                last_reduce_signal_time = None
             else:
                 position_qty = remaining_qty if is_long else -remaining_qty
+                if should_reduce and reduce_signal is not None:
+                    last_reduce_signal_time = reduce_signal.available_time
 
             if trades and trades[-1].net_pnl > 0 and recovery_positive_needed > 0:
                 recovery_positive_needed -= 1
@@ -364,23 +373,13 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
         can_open_short = (
             position_qty == 0
             and size_multiplier > 0
-            and short_signal is not None
+            and decision.action.decision == "sell"
+            and sell_signal is not None
             and decision.risk.conflict_level != "high"
             and decision.data_quality.status == "ok"
         )
 
-        entry_side = ""
-        if can_open_long and can_open_short and buy_signal is not None and short_signal is not None:
-            if buy_signal.confidence > short_signal.confidence:
-                entry_side = "long"
-            elif short_signal.confidence > buy_signal.confidence:
-                entry_side = "short"
-        elif can_open_long:
-            entry_side = "long"
-        elif can_open_short:
-            entry_side = "short"
-
-        if entry_side == "long" and buy_signal is not None:
+        if can_open_long and buy_signal is not None:
             buy_price = next_bar.open * (1 + config.slippage_rate)
             alloc_cash = cash * size_multiplier / (1 + config.fee_rate)
             if alloc_cash > 0 and buy_price > 0:
@@ -395,7 +394,8 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
                 position_signal_type = buy_signal.type
                 position_signal_index = i
                 position_stop_price = buy_signal.invalid_price
-        elif entry_side == "short" and short_signal is not None:
+                last_reduce_signal_time = None
+        elif can_open_short and sell_signal is not None:
             sell_price = next_bar.open * (1 - config.slippage_rate)
             alloc_notional = cash * size_multiplier / (1 + config.fee_rate)
             if alloc_notional > 0 and sell_price > 0:
@@ -407,9 +407,10 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
                 position_entry_price = sell_price
                 position_entry_fee = entry_fee
                 position_entry_time = next_bar.time
-                position_signal_type = short_signal.type
+                position_signal_type = sell_signal.type
                 position_signal_index = i
-                position_stop_price = short_signal.invalid_price
+                position_stop_price = sell_signal.invalid_price
+                last_reduce_signal_time = None
 
     # 最后一个bar补权益
     if bars_main:

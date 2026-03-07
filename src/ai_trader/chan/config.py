@@ -18,8 +18,8 @@ class ChanConfig:
     min_confidence: float = 0.60
     transitional_confidence_cap: float = 0.60
     missing_macd_penalty: float = 0.10
-    execution_buy_types: tuple[str, ...] = ("B3",)
-    execution_reduce_types: tuple[str, ...] = ("S3",)
+    execution_buy_types: tuple[str, ...] = ("B2", "B3")
+    execution_reduce_types: tuple[str, ...] = ("S2", "S3")
     execution_sell_types: tuple[str, ...] = ()
     execution_buy_min_confidence: float = 0.65
     execution_reduce_min_confidence: float = 0.65

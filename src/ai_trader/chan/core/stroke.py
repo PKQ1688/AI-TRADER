@@ -9,12 +9,22 @@ def _pick_extreme_same_kind(current: Fractal, incoming: Fractal) -> Fractal:
     return incoming if incoming.price <= current.price else current
 
 
-def _valid_bi_pair(start: Fractal, end: Fractal, bars: list[Bar], min_bars: int) -> bool:
+def _valid_bi_pair(
+    start: Fractal, end: Fractal, bars: list[Bar], min_bars: int
+) -> bool:
     if start.kind == end.kind:
         return False
-    if end.index - start.index < 2:
+    gap = end.index - start.index
+    if gap < 2:
         return False
-    if end.index - start.index + 1 < min_bars:
+    if gap + 1 < min_bars:
+        return False
+    # Ensure at least one independent bar between the two fractal windows.
+    # Each fractal occupies 3 bars centered on its index, so the windows
+    # don't share and leave a gap only when the distance >= 4.  With
+    # min_bars=5 this is always satisfied; with min_bars=4 we must
+    # explicitly enforce it to avoid degenerate bis.
+    if gap < 4:
         return False
 
     if start.kind == "bottom" and end.price <= start.price:

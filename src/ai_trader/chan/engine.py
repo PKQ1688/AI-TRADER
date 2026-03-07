@@ -3,8 +3,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from ai_trader.chan.config import ChanConfig, get_chan_config
-from ai_trader.chan.core.buy_sell_points import build_risk, decide_action, generate_signals
-from ai_trader.chan.core.center import build_zhongshus
+from ai_trader.chan.core.buy_sell_points import (
+    build_risk,
+    decide_action,
+    generate_signals,
+)
+from ai_trader.chan.core.center import build_zhongshus, build_zhongshus_from_bis
 from ai_trader.chan.core.divergence import detect_divergence_candidates
 from ai_trader.chan.core.fractal import detect_fractals
 from ai_trader.chan.core.include import merge_inclusions
@@ -29,7 +33,9 @@ def _bars_until(bars: list[Bar], asof_time) -> list[Bar]:
     return [bar for bar in bars if bar.time <= asof]
 
 
-def _normalize_macd(macd_values: Sequence[float] | Sequence[MACDPoint] | None, bars: list[Bar]) -> list[MACDPoint]:
+def _normalize_macd(
+    macd_values: Sequence[float] | Sequence[MACDPoint] | None, bars: list[Bar]
+) -> list[MACDPoint]:
     if macd_values is None:
         return compute_macd(bars)
     if not macd_values:
@@ -37,11 +43,18 @@ def _normalize_macd(macd_values: Sequence[float] | Sequence[MACDPoint] | None, b
 
     first = macd_values[0]
     if isinstance(first, MACDPoint):
-        return [item for item in macd_values if item.time <= bars[-1].time] if bars else list(macd_values)
+        return (
+            [item for item in macd_values if item.time <= bars[-1].time]
+            if bars
+            else list(macd_values)
+        )
 
     hist = [float(v) for v in macd_values]
     size = min(len(hist), len(bars))
-    return [MACDPoint(time=bars[i].time, dif=0.0, dea=0.0, hist=hist[i]) for i in range(size)]
+    return [
+        MACDPoint(time=bars[i].time, dif=0.0, dea=0.0, hist=hist[i])
+        for i in range(size)
+    ]
 
 
 def _insufficient_snapshot(
@@ -70,6 +83,7 @@ def _insufficient_snapshot(
         bis_sub=[],
         segments_main=[],
         segments_sub=[],
+        previous_main_bar_time=bars_main[-2].time if len(bars_main) >= 2 else None,
         zhongshus_main=[],
         zhongshus_sub=[],
         last_zhongshu_main=None,
@@ -121,17 +135,27 @@ def build_chan_state(
     bis_main = build_bis(fractals_main, merged_main, min_bars=cfg.min_stroke_bars)
     bis_sub = build_bis(fractals_sub, merged_sub, min_bars=cfg.min_stroke_bars)
 
-    segments_main = build_segments(bis_main, require_case2_confirmation=cfg.require_case2_confirmation)
-    segments_sub = build_segments(bis_sub, require_case2_confirmation=cfg.require_case2_confirmation)
+    segments_main = build_segments(
+        bis_main, require_case2_confirmation=cfg.require_case2_confirmation
+    )
+    segments_sub = build_segments(
+        bis_sub, require_case2_confirmation=cfg.require_case2_confirmation
+    )
 
     zhongshus_main = build_zhongshus(segments_main)
     zhongshus_sub = build_zhongshus(segments_sub)
+
+    # Build bi-level zhongshus for divergence detection (correct level per kline8-18)
+    bi_zhongshus_main = build_zhongshus_from_bis(bis_main)
 
     normalized_macd_main = _normalize_macd(macd_main, raw_main)
     normalized_macd_sub = _normalize_macd(macd_sub, raw_sub)
 
     last_close = merged_main[-1].close if merged_main else 0.0
-    market_state = infer_market_state(last_close, bis_main, segments_main, zhongshus_main)
+    # Use bi-level zhongshus for trend inference (more granular, correct level)
+    market_state = infer_market_state(
+        last_close, bis_main, segments_main, bi_zhongshus_main
+    )
 
     return ChanSnapshot(
         exchange=exchange,
@@ -149,6 +173,7 @@ def build_chan_state(
         bis_sub=bis_sub,
         segments_main=segments_main,
         segments_sub=segments_sub,
+        previous_main_bar_time=raw_main[-2].time if len(raw_main) >= 2 else None,
         zhongshus_main=zhongshus_main,
         zhongshus_sub=zhongshus_sub,
         last_zhongshu_main=zhongshus_main[-1] if zhongshus_main else None,
@@ -174,6 +199,21 @@ def _conflict_level(snapshot: ChanSnapshot) -> tuple[str, str]:
     return "high", "主次级别方向冲突"
 
 
+def _fresh_signals(snapshot: ChanSnapshot, signals):
+    if not signals:
+        return []
+    prev_main_time = snapshot.previous_main_bar_time
+    if prev_main_time is None and len(snapshot.bars_main) >= 2:
+        prev_main_time = snapshot.bars_main[-2].time
+    current_time = snapshot.asof_time
+    return [
+        item
+        for item in signals
+        if item.available_time <= current_time
+        and (prev_main_time is None or item.available_time > prev_main_time)
+    ]
+
+
 def generate_signal(
     snapshot: ChanSnapshot,
     macd_divergence_threshold: float = 0.10,
@@ -181,7 +221,11 @@ def generate_signal(
     chan_config: ChanConfig | None = None,
 ) -> SignalDecision:
     cfg = chan_config or get_chan_config("strict_kline8")
-    threshold = macd_divergence_threshold if macd_divergence_threshold > 0 else cfg.divergence_threshold
+    threshold = (
+        macd_divergence_threshold
+        if macd_divergence_threshold > 0
+        else cfg.divergence_threshold
+    )
     confidence_floor = min_confidence if min_confidence > 0 else cfg.min_confidence
 
     market_state = snapshot.market_state_main or MarketState(trend_type="range")
@@ -199,21 +243,23 @@ def generate_signal(
             cn_summary="当前数据不足，先补齐主次级别K线后再分析。",
         )
 
+    # Build bi-level zhongshus for divergence detection (a+A+b+B+c structure)
+    bi_zhongshus = build_zhongshus_from_bis(snapshot.bis_main)
+
     divergence = detect_divergence_candidates(
         bis=snapshot.bis_main,
         zhongshu_count=market_state.zhongshu_count,
         trend_type=market_state.trend_type,
         macd=snapshot.macd_main,
         threshold=threshold,
+        zhongshus=bi_zhongshus,
     )
 
     macd_missing = len(snapshot.macd_main) == 0
-    bars_close = snapshot.bars_main[-1].close if snapshot.bars_main else 0.0
     signals = generate_signals(
         divergence_candidates=divergence,
-        bis_main=snapshot.bis_main,
         bis_sub=snapshot.bis_sub,
-        bars_close=bars_close,
+        segments_sub=snapshot.segments_sub,
         zhongshu_main=snapshot.last_zhongshu_main,
         market_state=market_state,
         macd_missing=macd_missing,
@@ -221,8 +267,12 @@ def generate_signal(
         transitional_confidence_cap=cfg.transitional_confidence_cap,
     )
 
+    fresh_signals = _fresh_signals(snapshot, signals)
+
     conflict_level, conflict_note = _conflict_level(snapshot)
-    action, summary = decide_action(signals, market_state, conflict_level, confidence_floor, cfg)
+    action, summary = decide_action(
+        fresh_signals, market_state, conflict_level, confidence_floor, cfg
+    )
 
     return SignalDecision(
         exchange=snapshot.exchange,
@@ -231,7 +281,7 @@ def generate_signal(
         timeframe_sub=snapshot.timeframe_sub,
         data_quality=snapshot.data_quality,
         market_state=market_state,
-        signals=signals,
+        signals=fresh_signals,
         action=action,
         risk=build_risk(conflict_level, conflict_note),
         cn_summary=summary,
