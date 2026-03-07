@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Chan Review</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+
+      <!-- ── Top bar ── -->
+      <header class="topbar">
+        <span class="topbar-brand">缠论验图</span>
+        <span class="topbar-divider">|</span>
+        <span class="topbar-session" id="session-info">-</span>
+        <span class="topbar-spacer"></span>
+        <span id="status-line" class="topbar-status">等待加载</span>
+        <button class="btn-settings" id="settings-btn" type="button">⚙ 配置</button>
+      </header>
+
+      <!-- ── Workspace ── -->
+      <div class="workspace">
+
+        <!-- Left: chart area -->
+        <div class="chart-panel">
+
+          <div class="layer-bar">
+            <span class="layer-label">图层</span>
+            <button class="layer-btn active" data-layer="raw"       type="button">原K</button>
+            <button class="layer-btn active" data-layer="merged"    type="button">合K</button>
+            <button class="layer-btn active" data-layer="fractals"  type="button">分型</button>
+            <button class="layer-btn active" data-layer="bis"       type="button">笔</button>
+            <button class="layer-btn active" data-layer="segments"  type="button">线段</button>
+            <button class="layer-btn active" data-layer="zhongshus" type="button">中枢</button>
+          </div>
+
+          <div class="chart-wrap">
+            <div class="chart-header">
+              <span class="eyebrow">Main</span>
+              <span id="main-tf-label" class="chart-tf">-</span>
+              <span id="main-counts"   class="chart-counts">-</span>
+            </div>
+            <div id="main-chart" class="chart-surface"></div>
+          </div>
+
+          <div class="chart-wrap">
+            <div class="chart-header">
+              <span class="eyebrow">Sub</span>
+              <span id="sub-tf-label" class="chart-tf">-</span>
+              <span id="sub-counts"   class="chart-counts">-</span>
+            </div>
+            <div id="sub-chart" class="chart-surface"></div>
+          </div>
+
+        </div>
+
+        <!-- Right: control sidebar -->
+        <aside class="side-panel">
+
+          <!-- Decision -->
+          <div class="side-block">
+            <div id="decision-card" class="decision-card">
+              <div class="stack-item"><p>等待加载。</p></div>
+            </div>
+          </div>
+
+          <!-- Timeline -->
+          <div class="side-block timeline-block">
+            <div class="timeline-top">
+              <span class="side-label">时间轴</span>
+              <span id="asof-label" class="asof-label">-</span>
+            </div>
+            <input id="asof-slider" type="range" min="0" max="0" step="1" value="0" />
+            <div class="step-row">
+              <button id="step-prev" class="btn-step" type="button">◀ 上一根</button>
+              <span id="session-summary" class="badge">未加载</span>
+              <button id="step-next" class="btn-step" type="button">下一根 ▶</button>
+            </div>
+            <div class="params-grid">
+              <div class="params-col">
+                <span class="params-col-label">数据窗口</span>
+                <div class="window-row">
+                  <label class="window-field">
+                    <span>主</span>
+                    <input id="window-main" type="number" min="20" step="10" />
+                  </label>
+                  <label class="window-field">
+                    <span>次</span>
+                    <input id="window-sub" type="number" min="20" step="10" />
+                  </label>
+                </div>
+              </div>
+              <div class="params-col">
+                <span class="params-col-label">图表视窗</span>
+                <div class="window-row">
+                  <label class="window-field">
+                    <span>主</span>
+                    <input id="view-main" type="number" min="10" step="10" value="60" />
+                  </label>
+                  <label class="window-field">
+                    <span>次</span>
+                    <input id="view-sub" type="number" min="10" step="10" value="80" />
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Signals (collapsible, open by default) -->
+          <details class="side-block collapsible" open>
+            <summary>
+              <span>信号</span>
+              <span id="signal-count" class="badge">-</span>
+            </summary>
+            <div id="signals-list" class="stack-list"></div>
+          </details>
+
+          <!-- Inclusion audit (collapsible, closed by default) -->
+          <details class="side-block collapsible">
+            <summary>包含轨迹</summary>
+            <div class="audit-panels">
+              <p class="eyebrow">主级别</p>
+              <div id="merge-main-table" class="table-shell"></div>
+              <p class="eyebrow">次级别</p>
+              <div id="merge-sub-table" class="table-shell"></div>
+            </div>
+          </details>
+
+        </aside>
+      </div>
+
+      <!-- ── Settings Modal ── -->
+      <div class="modal-overlay hidden" id="modal-overlay">
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+          <div class="modal-head">
+            <h2 id="modal-title">配置数据源</h2>
+            <button class="btn-close" id="modal-close" type="button" aria-label="关闭">✕</button>
+          </div>
+          <form id="control-form" class="settings-form">
+            <div class="settings-grid">
+              <label>
+                <span>交易所</span>
+                <input id="exchange" name="exchange" type="text" />
+              </label>
+              <label>
+                <span>交易对</span>
+                <input id="symbol" name="symbol" type="text" />
+              </label>
+              <label>
+                <span>主级别</span>
+                <input id="timeframe-main" name="timeframe_main" type="text" />
+              </label>
+              <label>
+                <span>次级别</span>
+                <input id="timeframe-sub" name="timeframe_sub" type="text" />
+              </label>
+              <label>
+                <span>开始时间</span>
+                <input id="start" name="start" type="text" />
+              </label>
+              <label>
+                <span>结束时间</span>
+                <input id="end" name="end" type="text" />
+              </label>
+              <label class="span-2">
+                <span>缠论模式</span>
+                <select id="chan-mode" name="chan_mode">
+                  <option value="strict_kline8">strict_kline8</option>
+                  <option value="pragmatic">pragmatic</option>
+                </select>
+              </label>
+            </div>
+            <div class="modal-actions">
+              <button type="button" id="modal-cancel" class="btn-secondary">取消</button>
+              <button type="submit" id="load-button" class="btn-primary">加载数据</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+    </div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

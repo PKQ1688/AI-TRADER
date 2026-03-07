@@ -131,6 +131,41 @@ uv run python scripts/run_chan_replay.py \
 - `summary.json`
 - `summary.md`
 
+## 本地人工验图页
+
+用于在浏览器里逐根回放主级别 bar，人工核对：
+
+- 原始 K 线 / 包含处理后的 K 线
+- 分型 / 笔 / 线段 / 中枢
+- 当前 `signals` 与 `event_time / available_time`
+
+启动示例：
+
+```bash
+uv run python scripts/run_chan_review_server.py \
+  --exchange binance \
+  --symbol BTC/USDT \
+  --timeframe-main 4h \
+  --timeframe-sub 1h \
+  --start 2024-01-01T00:00:00Z \
+  --end 2024-03-01T00:00:00Z \
+  --chan-mode strict_kline8 \
+  --window-main 120 \
+  --window-sub 180
+```
+
+默认地址：
+
+`http://127.0.0.1:8765`
+
+说明：
+
+- 页面不会在前端重算缠论结构，而是直接展示 Python 引擎返回的快照。
+- 页面内可按图层开关分别切换：原始 K 线、包含后 K 线、分型、笔、线段、中枢。
+- 包含处理支持显示”合并后的 K 线由哪些原始 K 线组成”。
+- `--window-main` / `--window-sub` 控制主/次级别可视 bar 数量（默认 120 / 180）。
+- 若本地缓存不足，请先运行 `scripts/warm_cache.py` 预热数据。
+
 ## 视觉复核（OpenAI 兼容 `chat/completions`）
 
 先准备一个诊断目录，再提供一张或多张图表截图给视觉模型复核。
@@ -161,6 +196,23 @@ uv run python scripts/run_chan_vlm_review.py \
 - `review_input.json`（发送前的结构化上下文和请求元数据，不含 API key）
 - `review_response.json`（模型原始返回）
 - `summary.md`（可读摘要）
+
+## 过滤规则对比（strict_kline8 vs pragmatic）
+
+在同一历史区间同时跑两套执行模式，对比核心指标、稳定性和动作分布：
+
+```bash
+uv run python scripts/run_filter_comparison.py
+```
+
+输出目录示例：
+
+`outputs/comparison/filter_modes/<run_id>/`
+
+包含：
+
+- `comparison.json`（两套配置的完整指标与 delta）
+- `summary.md`（可读对比表格，含总收益率、年化收益、最大回撤、夏普、交易数、期望收益、p-value、repaint rate）
 
 ## Kline8 对齐审计
 
