@@ -3,70 +3,62 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Chan Review</title>
+    <title>缠论验图</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <div class="app-shell">
-
-      <!-- ── Top bar ── -->
       <header class="topbar">
-        <span class="topbar-brand">缠论验图</span>
-        <span class="topbar-divider">|</span>
-        <span class="topbar-session" id="session-info">-</span>
-        <span class="topbar-spacer"></span>
+        <div class="topbar-brand-wrap">
+          <span class="topbar-brand">缠论验图</span>
+          <span class="topbar-divider">|</span>
+          <span class="topbar-session" id="session-info">-</span>
+        </div>
         <span id="status-line" class="topbar-status">等待加载</span>
         <button class="btn-settings" id="settings-btn" type="button">⚙ 配置</button>
       </header>
 
-      <!-- ── Workspace ── -->
+      <div class="layer-bar">
+        <span class="layer-label">图层</span>
+        <button class="layer-btn active" data-layer="raw" type="button">原K</button>
+        <button class="layer-btn active" data-layer="merged" type="button">合K</button>
+        <button class="layer-btn active" data-layer="fractals" type="button">分型</button>
+        <button class="layer-btn active" data-layer="bis" type="button">笔</button>
+        <button class="layer-btn active" data-layer="segments" type="button">线段</button>
+        <button class="layer-btn active" data-layer="zhongshus" type="button">中枢</button>
+      </div>
+
       <div class="workspace">
-
-        <!-- Left: chart area -->
         <div class="chart-panel">
-
-          <div class="layer-bar">
-            <span class="layer-label">图层</span>
-            <button class="layer-btn active" data-layer="raw"       type="button">原K</button>
-            <button class="layer-btn active" data-layer="merged"    type="button">合K</button>
-            <button class="layer-btn active" data-layer="fractals"  type="button">分型</button>
-            <button class="layer-btn active" data-layer="bis"       type="button">笔</button>
-            <button class="layer-btn active" data-layer="segments"  type="button">线段</button>
-            <button class="layer-btn active" data-layer="zhongshus" type="button">中枢</button>
-          </div>
-
-          <div class="chart-wrap">
-            <div class="chart-header">
+          <section class="chart-card">
+            <div class="chart-card-header">
               <span class="eyebrow">Main</span>
               <span id="main-tf-label" class="chart-tf">-</span>
-              <span id="main-counts"   class="chart-counts">-</span>
+              <span id="main-counts" class="chart-counts">-</span>
             </div>
-            <div id="main-chart" class="chart-surface"></div>
-          </div>
+            <div id="main-detail" class="detail-surface"></div>
+            <div id="main-overview" class="overview-surface"></div>
+          </section>
 
-          <div class="chart-wrap">
-            <div class="chart-header">
+          <section class="chart-card">
+            <div class="chart-card-header">
               <span class="eyebrow">Sub</span>
               <span id="sub-tf-label" class="chart-tf">-</span>
-              <span id="sub-counts"   class="chart-counts">-</span>
+              <span id="sub-counts" class="chart-counts">-</span>
             </div>
-            <div id="sub-chart" class="chart-surface"></div>
-          </div>
-
+            <div id="sub-detail" class="detail-surface"></div>
+            <div id="sub-overview" class="overview-surface"></div>
+          </section>
         </div>
 
-        <!-- Right: control sidebar -->
         <aside class="side-panel">
-
-          <!-- Decision -->
-          <div class="side-block">
+          <section class="side-block">
             <div id="decision-card" class="decision-card">
               <div class="stack-item"><p>等待加载。</p></div>
             </div>
-          </div>
+          </section>
 
-          <!-- Timeline -->
-          <div class="side-block timeline-block">
+          <section class="side-block timeline-block">
             <div class="timeline-top">
               <span class="side-label">时间轴</span>
               <span id="asof-label" class="asof-label">-</span>
@@ -76,6 +68,12 @@
               <button id="step-prev" class="btn-step" type="button">◀ 上一根</button>
               <span id="session-summary" class="badge">未加载</span>
               <button id="step-next" class="btn-step" type="button">下一根 ▶</button>
+            </div>
+          </section>
+
+          <section class="side-block view-block">
+            <div class="block-head">
+              <span class="side-label">视图控制</span>
             </div>
             <div class="params-grid">
               <div class="params-col">
@@ -96,18 +94,17 @@
                 <div class="window-row">
                   <label class="window-field">
                     <span>主</span>
-                    <input id="view-main" type="number" min="10" step="10" value="60" />
+                    <input id="view-main" type="number" min="10" step="10" value="40" />
                   </label>
                   <label class="window-field">
                     <span>次</span>
-                    <input id="view-sub" type="number" min="10" step="10" value="80" />
+                    <input id="view-sub" type="number" min="10" step="10" value="50" />
                   </label>
                 </div>
               </div>
             </div>
-          </div>
+          </section>
 
-          <!-- Signals (collapsible, open by default) -->
           <details class="side-block collapsible" open>
             <summary>
               <span>信号</span>
@@ -116,7 +113,6 @@
             <div id="signals-list" class="stack-list"></div>
           </details>
 
-          <!-- Inclusion audit (collapsible, closed by default) -->
           <details class="side-block collapsible">
             <summary>包含轨迹</summary>
             <div class="audit-panels">
@@ -126,11 +122,9 @@
               <div id="merge-sub-table" class="table-shell"></div>
             </div>
           </details>
-
         </aside>
       </div>
 
-      <!-- ── Settings Modal ── -->
       <div class="modal-overlay hidden" id="modal-overlay">
         <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
           <div class="modal-head">
@@ -178,7 +172,6 @@
           </form>
         </div>
       </div>
-
     </div>
     <script src="/app.js" defer></script>
   </body>
