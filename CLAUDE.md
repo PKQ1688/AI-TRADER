@@ -88,18 +88,10 @@ Iterates bars bar-by-bar (primary timeframe: 4h, sub timeframe: 1h). Key mechani
 - Freeze/recovery: pause at 18% DD, resume after 21 days or new qualifying setup
 - Outputs to `outputs/`: `signals.csv`, `trades.csv`, `equity_curve.csv`, `report.json`, `summary.md`
 
-### LLM Integration (`src/ai_trader/llm/`)
-
-- `openai_compat.py` — OpenAI-compatible API wrapper (defaults to packyapi endpoint)
-- `chan_vlm_review.py` — submits chart images + ChanSnapshot context to a multimodal LLM for visual review
-
 ### Environment Variables
 
 ```
 AI_TRADER_DATA_DIR          # Local OHLCV CSV cache directory (default: data/raw/)
-AI_TRADER_OPENAI_BASE_URL   # OpenAI-compatible endpoint
-AI_TRADER_OPENAI_MODEL      # Model name (default: gpt-5.4)
-AI_TRADER_OPENAI_API_KEY    # API key for visual reviews
 ```
 
 ### Key Conventions

@@ -5,10 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "agno>=2.2.1",
     "ccxt>=4.5.14",
     "empyrical-reloaded>=0.5.11",
-    "openai>=2.6.1",
     "quantstats>=0.0.64",
     "python-dotenv>=1.2.1",
     "rich>=14.2.0",
