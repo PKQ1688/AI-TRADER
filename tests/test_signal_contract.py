@@ -32,6 +32,7 @@ class SignalContractTest(unittest.TestCase):
             "last_zhongshu",
             "current_stroke_dir",
             "current_segment_dir",
+            "oscillation_state",
         ]:
             self.assertIn(key, market_state)
 
@@ -43,6 +44,22 @@ class SignalContractTest(unittest.TestCase):
         last_zs = market_state["last_zhongshu"]
         for key in ["zd", "zg", "gg", "dd"]:
             self.assertIn(key, last_zs)
+
+        oscillation = market_state["oscillation_state"]
+        for key in [
+            "anchor_source",
+            "anchor_start_index",
+            "z",
+            "latest_zn",
+            "count",
+            "total_count",
+            "bias",
+            "direction",
+            "breakout",
+            "first_breakout",
+            "limit_reached",
+        ]:
+            self.assertIn(key, oscillation)
 
         self.assertIn(payload["action"]["decision"], {"buy", "sell", "reduce", "hold", "wait"})
         self.assertIn(payload["risk"]["conflict_level"], {"none", "low", "high"})

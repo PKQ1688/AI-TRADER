@@ -27,6 +27,7 @@ def _build_center_from_three_segments(
         end_index=s3.end_index,
         event_time=s3.event_time,
         available_time=max(s1.available_time, s2.available_time, s3.available_time),
+        origin_available_time=max(s1.available_time, s2.available_time, s3.available_time),
         evolution="newborn",
         status="confirmed",
     )
@@ -53,6 +54,7 @@ def _build_center_from_three_bis(b1: Bi, b2: Bi, b3: Bi) -> Zhongshu | None:
         end_index=b3.end_index,
         event_time=b3.event_time,
         available_time=max(b1.available_time, b2.available_time, b3.available_time),
+        origin_available_time=max(b1.available_time, b2.available_time, b3.available_time),
         evolution="newborn",
         status="confirmed",
     )
@@ -89,6 +91,7 @@ def _merge_two_centers(prev: Zhongshu, cur: Zhongshu) -> Zhongshu:
         end_index=cur.end_index,
         event_time=cur.event_time,
         available_time=max(prev.available_time, cur.available_time),
+        origin_available_time=prev.origin_available_time,
         evolution="expansion",
         status="confirmed",
     )
@@ -96,7 +99,7 @@ def _merge_two_centers(prev: Zhongshu, cur: Zhongshu) -> Zhongshu:
 
 def _evolve_and_append(out: list[Zhongshu], candidate: Zhongshu) -> None:
     """Determine the relationship between candidate and the last zhongshu,
-    then either extend, merge (expansion), or append as newborn.
+    then either extend, mark expansion, or append as newborn.
     """
     if not out:
         out.append(candidate)
@@ -118,11 +121,16 @@ def _evolve_and_append(out: list[Zhongshu], candidate: Zhongshu) -> None:
         prev.evolution = "extension"
         return
 
-    # Case 2: 中枢区间 no overlap but wave ranges touch → expansion
-    # (kline8-20: level upgrade, merge into bigger center)
+    # Case 2: 中枢区间 no overlap but wave ranges touch → expansion.
+    #
+    # Preserve the current-level center sequence instead of collapsing it
+    # into a synthetic larger center.  Kline8-20 treats this as 级别扩张,
+    # which means the previous and current centers imply a higher-level
+    # structure, but they should not erase the current-level history that
+    # later B3 / trend checks rely on.
     if _wave_ranges_touch(prev, candidate):
-        merged = _merge_two_centers(prev, candidate)
-        out[-1] = merged
+        candidate.evolution = cast(ZhongshuEvolution, "expansion")
+        out.append(candidate)
         return
 
     # Case 3: completely separate → newborn

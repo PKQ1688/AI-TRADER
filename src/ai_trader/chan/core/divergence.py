@@ -15,6 +15,9 @@ class DivergenceCandidate:
     invalid_price: float
     event_time: object
     available_time: object
+    anchor_center_start_index: int | None = None
+    anchor_center_end_index: int | None = None
+    anchor_center_available_time: object | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -95,45 +98,84 @@ def _center_member_span(
     return indices[0], indices[-1]
 
 
-def _trend_leg_before_center(
-    bis: list[Bi], center: Zhongshu, direction: str
-) -> Bi | None:
-    span = _center_member_span(bis, center)
-    if span is None:
-        return None
+def _bi_overlaps_center(bi: Bi, center: Zhongshu) -> bool:
+    return bi.high >= center.zd and bi.low <= center.zg
 
-    first_idx, _ = span
-    for idx in range(first_idx - 1, -1, -1):
-        if bis[idx].direction == direction:
-            return bis[idx]
-    return None
+
+def _bi_leaves_center(bi: Bi, center: Zhongshu, direction: str) -> bool:
+    if bi.direction != direction:
+        return False
+    if direction == "down":
+        return bi.low < center.zd
+    return bi.high > center.zg
+
+
+def _trend_leg_before_center(
+    bis: list[Bi],
+    zhongshus: list[Zhongshu],
+    center_idx: int,
+    direction: str,
+) -> list[Bi]:
+    center_span = _center_member_span(bis, zhongshus[center_idx])
+    if center_span is None:
+        return []
+
+    first_idx, _ = center_span
+    if center_idx > 0:
+        prev_span = _center_member_span(bis, zhongshus[center_idx - 1])
+        if prev_span is None:
+            return []
+        start_idx = prev_span[1] + 1
+    else:
+        start_idx = -1
+        for idx in range(first_idx - 1, -1, -1):
+            if bis[idx].direction == direction:
+                start_idx = idx
+                break
+        if start_idx < 0:
+            return []
+
+    if start_idx >= first_idx:
+        return []
+    return bis[start_idx:first_idx]
 
 
 def _trend_leg_after_center(
-    bis: list[Bi], center: Zhongshu, direction: str
+    bis: list[Bi],
+    zhongshus: list[Zhongshu],
+    center_idx: int,
 ) -> list[Bi]:
-    span = _center_member_span(bis, center)
-    if span is None:
+    center_span = _center_member_span(bis, zhongshus[center_idx])
+    if center_span is None:
         return []
 
-    _, last_idx = span
-    return [bi for bi in bis[last_idx + 1 :] if bi.direction == direction]
+    _, last_idx = center_span
+    end_idx = len(bis)
+    if center_idx + 1 < len(zhongshus):
+        next_span = _center_member_span(bis, zhongshus[center_idx + 1])
+        if next_span is None:
+            return []
+        end_idx = next_span[0]
+
+    if last_idx + 1 >= end_idx:
+        return []
+    return bis[last_idx + 1 : end_idx]
 
 
 def _find_trend_segments(
     bis: list[Bi],
     zhongshus: list[Zhongshu],
     direction: str,
-) -> tuple[Bi, list[Bi], Zhongshu, Zhongshu] | None:
-    """Try to identify a+A+b+B+c structure and return (a_bi, c_bis, A, B).
+) -> tuple[list[Bi], list[Bi], list[Bi], list[Bi], Zhongshu, Zhongshu] | None:
+    """Try to identify a+A+b+B+c structure.
 
     For a downtrend direction="down":
       - Need at least 2 zhongshus with zg(later) < zd(earlier) (down trend)
-      - a = down-direction bis before A (first zhongshu)
-      - c = down-direction bis after B (second/last zhongshu)
+      - a = the connector window before A (first zhongshu)
+      - c = the connector window after B (second/last zhongshu)
 
-    We use the immediate directional leg before A and the directional bis
-    after B. This avoids contaminating the a-leg with much older history.
+    Windows are truncated by neighboring centers so c does not spill into
+    later expansion / transitional structures.
     """
     if len(zhongshus) < 2:
         return None
@@ -144,19 +186,23 @@ def _find_trend_segments(
             B = zhongshus[j]
             A = zhongshus[j - 1]
             if B.zg < A.zd:
-                a_bi = _trend_leg_before_center(bis, A, "down")
-                c_bis = _trend_leg_after_center(bis, B, "down")
-                if a_bi is not None and c_bis:
-                    return a_bi, c_bis, A, B
+                a_window = _trend_leg_before_center(bis, zhongshus, j - 1, direction)
+                c_window = _trend_leg_after_center(bis, zhongshus, j)
+                a_dir = [bi for bi in a_window if bi.direction == direction]
+                c_dir = [bi for bi in c_window if bi.direction == direction]
+                if a_dir and c_dir:
+                    return a_window, c_window, a_dir, c_dir, A, B
     else:
         for j in range(len(zhongshus) - 1, 0, -1):
             B = zhongshus[j]
             A = zhongshus[j - 1]
             if B.zd > A.zg:
-                a_bi = _trend_leg_before_center(bis, A, "up")
-                c_bis = _trend_leg_after_center(bis, B, "up")
-                if a_bi is not None and c_bis:
-                    return a_bi, c_bis, A, B
+                a_window = _trend_leg_before_center(bis, zhongshus, j - 1, direction)
+                c_window = _trend_leg_after_center(bis, zhongshus, j)
+                a_dir = [bi for bi in a_window if bi.direction == direction]
+                c_dir = [bi for bi in c_window if bi.direction == direction]
+                if a_dir and c_dir:
+                    return a_window, c_window, a_dir, c_dir, A, B
 
     return None
 
@@ -173,20 +219,63 @@ def _latest_pair_same_direction(bis: list[Bi], direction: str) -> tuple[Bi, Bi] 
     return seq[-2], seq[-1]
 
 
+def _latest_consolidation_departure_pair(
+    bis: list[Bi],
+    center: Zhongshu,
+    direction: str,
+) -> tuple[Bi, Bi] | None:
+    center_confirmed_at = center.origin_available_time or center.available_time
+    confirmed = [
+        item
+        for item in bis
+        if item.status == "confirmed" and item.available_time >= center_confirmed_at
+    ]
+    departures = [
+        idx
+        for idx, item in enumerate(confirmed)
+        if _bi_leaves_center(item, center, direction)
+    ]
+    if len(departures) < 2:
+        return None
+
+    reentry_direction = "up" if direction == "down" else "down"
+    for offset in range(len(departures) - 1, 0, -1):
+        prev_idx = departures[offset - 1]
+        cur_idx = departures[offset]
+        between = confirmed[prev_idx + 1 : cur_idx]
+        if not any(
+            item.direction == reentry_direction and _bi_overlaps_center(item, center)
+            for item in between
+        ):
+            continue
+        return confirmed[prev_idx], confirmed[cur_idx]
+
+    return None
+
+
 def _build_candidate(
     direction: str,
     mode: str,
     cur_bi: Bi,
     weaken_ratio: float,
+    anchor_center: Zhongshu,
 ) -> DivergenceCandidate:
     if direction == "down":
         signal_type = "B1"
-        trigger = "主级别向下走势创新低但MACD柱子面积衰减（背驰候选）"
-        invalid_if = f"价格继续跌破{cur_bi.end_price:.2f}并延续下行"
+        if mode == "trend":
+            trigger = "主级别向下走势创新低但MACD柱子面积衰减（背驰候选）"
+            invalid_if = f"价格继续跌破{cur_bi.end_price:.2f}并延续下行"
+        else:
+            trigger = "单中枢震荡中向下离开后再创新低但力度衰减（盘整背驰候选）"
+            invalid_if = f"价格继续跌破{cur_bi.end_price:.2f}并延续离开中枢"
     else:
         signal_type = "S1"
-        trigger = "主级别向上走势创新高但MACD柱子面积衰减（背驰候选）"
-        invalid_if = f"价格继续突破{cur_bi.end_price:.2f}并延续上行"
+        if mode == "trend":
+            trigger = "主级别向上走势创新高但MACD柱子面积衰减（背驰候选）"
+            invalid_if = f"价格继续突破{cur_bi.end_price:.2f}并延续上行"
+        else:
+            trigger = "单中枢震荡中向上离开后再创新高但力度衰减（盘整背驰候选）"
+            invalid_if = f"价格继续突破{cur_bi.end_price:.2f}并延续离开中枢"
 
     base = 0.60 if mode == "trend" else 0.50
     confidence = max(0.0, min(1.0, base + min(0.25, weaken_ratio)))
@@ -200,6 +289,10 @@ def _build_candidate(
         invalid_price=cur_bi.end_price,
         event_time=cur_bi.event_time,
         available_time=cur_bi.available_time,
+        anchor_center_start_index=anchor_center.start_index,
+        anchor_center_end_index=anchor_center.end_index,
+        anchor_center_available_time=anchor_center.origin_available_time
+        or anchor_center.available_time,
     )
 
 
@@ -210,6 +303,8 @@ def detect_divergence_candidates(
     macd: list[MACDPoint],
     threshold: float,
     zhongshus: list[Zhongshu] | None = None,
+    allow_consolidation_fallback: bool = True,
+    consolidation_anchor: Zhongshu | None = None,
 ) -> list[DivergenceCandidate]:
     """Detect trend divergence and consolidation divergence.
 
@@ -219,8 +314,9 @@ def detect_divergence_candidates(
        compares the MACD area of a-segment vs c-segment.
     3. Requires DIF/DEA zero-axis pullback between segments as precondition
        for trend divergence.
-    4. Falls back to comparing last two same-direction bis when no
-       a+A+b+B+c structure is found (consolidation divergence).
+    4. Falls back to restricted single-center oscillation divergence:
+       two same-direction departures from one center with a re-entry
+       to the center in between.
     """
     out: list[DivergenceCandidate] = []
     if zhongshus is None:
@@ -236,43 +332,55 @@ def detect_divergence_candidates(
         if is_trend and len(zhongshus) >= 2:
             result = _find_trend_segments(bis, zhongshus, direction)
             if result is not None:
-                a_bi, c_bis, A_zs, B_zs = result
+                a_window, c_window, a_dir_bis, c_dir_bis, A_zs, B_zs = result
 
                 # Precondition: c must create new extreme beyond a
                 if direction == "down":
-                    a_extreme = a_bi.end_price
-                    c_extreme = min(bi.end_price for bi in c_bis)
+                    a_extreme = min(bi.end_price for bi in a_dir_bis)
+                    c_extreme = min(bi.end_price for bi in c_dir_bis)
                     price_new_extreme = c_extreme < a_extreme
                 else:
-                    a_extreme = a_bi.end_price
-                    c_extreme = max(bi.end_price for bi in c_bis)
+                    a_extreme = max(bi.end_price for bi in a_dir_bis)
+                    c_extreme = max(bi.end_price for bi in c_dir_bis)
                     price_new_extreme = c_extreme > a_extreme
 
                 if price_new_extreme:
                     # Zero-axis pullback check in the gap (B region)
                     pullback_ok = _zero_axis_pullback(
-                        macd, B_zs.event_time, B_zs.available_time
+                        macd, A_zs.available_time, B_zs.available_time
                     )
 
                     if pullback_ok:
                         a_area = _macd_area_directed(
-                            macd, a_bi.event_time, A_zs.event_time, direction
+                            macd, a_window[0].event_time, A_zs.available_time, direction
                         )
                         c_area = _macd_area_directed(
-                            macd, B_zs.available_time, c_bis[-1].available_time, direction
+                            macd, B_zs.available_time, c_window[-1].available_time, direction
                         )
 
                         if a_area > 0:
                             weaken = (a_area - c_area) / a_area
                             if weaken >= threshold:
-                                cur_bi = c_bis[-1]
+                                cur_bi = c_dir_bis[-1]
                                 out.append(
-                                    _build_candidate(direction, "trend", cur_bi, weaken)
+                                    _build_candidate(
+                                        direction,
+                                        "trend",
+                                        cur_bi,
+                                        weaken,
+                                        B_zs,
+                                    )
                                 )
                                 continue  # found trend divergence, skip fallback
 
-        # ----- Fallback: consolidation divergence (last two same-dir bis) -----
-        pair = _latest_pair_same_direction(bis, direction)
+        if not allow_consolidation_fallback:
+            continue
+
+        # ----- Restricted single-center consolidation divergence -----
+        center = consolidation_anchor or (zhongshus[-1] if zhongshus else None)
+        if center is None:
+            continue
+        pair = _latest_consolidation_departure_pair(bis, center, direction)
         if pair is None:
             continue
 
@@ -300,6 +408,6 @@ def detect_divergence_candidates(
             continue
 
         mode = "consolidation"
-        out.append(_build_candidate(direction, mode, cur_bi, weaken_ratio))
+        out.append(_build_candidate(direction, mode, cur_bi, weaken_ratio, center))
 
     return out

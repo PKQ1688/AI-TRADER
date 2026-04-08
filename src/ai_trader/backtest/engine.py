@@ -62,6 +62,16 @@ def _top_signal(signals: list[Signal], signal_types: set[str], min_confidence: f
     return candidates[0]
 
 
+def _signal_center_key(signal: Signal | None, snapshot) -> tuple[str, int] | None:
+    if signal is None or signal.type not in {"B3", "S3"}:
+        return None
+    if signal.anchor_center_start_index is not None:
+        return (signal.type, signal.anchor_center_start_index)
+    if snapshot.last_zhongshu_main is not None:
+        return (signal.type, snapshot.last_zhongshu_main.start_index)
+    return None
+
+
 def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bars_sub: list[Bar] | None = None) -> BacktestReport:
     chan_config = get_chan_config(config.chan_mode)
     buy_entry_types = set(chan_config.execution_buy_types)
@@ -116,7 +126,9 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
     position_signal_type = "B2"
     position_signal_index = -1
     position_stop_price: float | None = None
-    last_reduce_signal_time = None
+    last_reduce_signature: tuple | None = None
+    consumed_buy_center_keys: set[tuple[str, int]] = set()
+    consumed_sell_center_keys: set[tuple[str, int]] = set()
 
     frozen = False
     freeze_start = None
@@ -193,7 +205,8 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
             )
 
         now_key = iso_utc(bar.time)
-        signal_signatures[now_key] = _decision_signature(decision_dict)
+        decision_signature = _decision_signature(decision_dict)
+        signal_signatures[now_key] = decision_signature
 
         if i > 120:
             prev_time = bars_main[i - 1].time
@@ -258,6 +271,8 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
             max(config.min_confidence, chan_config.execution_reduce_min_confidence),
         )
         sell_signal = _top_signal(decision.signals, sell_entry_types, sell_entry_min_conf)
+        buy_center_key = _signal_center_key(buy_signal, snapshot)
+        sell_center_key = _signal_center_key(sell_signal, snapshot)
 
         # 先处理平仓/减仓（t信号，t+1开盘执行）
         should_close = False
@@ -271,7 +286,7 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
             elif (
                 decision.action.decision == "reduce"
                 and reduce_signal is not None
-                and reduce_signal.available_time != last_reduce_signal_time
+                and decision_signature != last_reduce_signature
             ):
                 should_reduce = True
         elif position_qty < 0:
@@ -352,11 +367,11 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
                 position_entry_time = None
                 position_signal_index = -1
                 position_stop_price = None
-                last_reduce_signal_time = None
+                last_reduce_signature = None
             else:
                 position_qty = remaining_qty if is_long else -remaining_qty
-                if should_reduce and reduce_signal is not None:
-                    last_reduce_signal_time = reduce_signal.available_time
+                if should_reduce:
+                    last_reduce_signature = decision_signature
 
             if trades and trades[-1].net_pnl > 0 and recovery_positive_needed > 0:
                 recovery_positive_needed -= 1
@@ -367,14 +382,17 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
             and size_multiplier > 0
             and decision.action.decision == "buy"
             and buy_signal is not None
+            and (buy_center_key is None or buy_center_key not in consumed_buy_center_keys)
             and decision.risk.conflict_level != "high"
             and decision.data_quality.status == "ok"
         )
         can_open_short = (
             position_qty == 0
             and size_multiplier > 0
+            and config.allow_short_entries
             and decision.action.decision == "sell"
             and sell_signal is not None
+            and (sell_center_key is None or sell_center_key not in consumed_sell_center_keys)
             and decision.risk.conflict_level != "high"
             and decision.data_quality.status == "ok"
         )
@@ -394,7 +412,9 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
                 position_signal_type = buy_signal.type
                 position_signal_index = i
                 position_stop_price = buy_signal.invalid_price
-                last_reduce_signal_time = None
+                last_reduce_signature = None
+                if buy_center_key is not None:
+                    consumed_buy_center_keys.add(buy_center_key)
         elif can_open_short and sell_signal is not None:
             sell_price = next_bar.open * (1 - config.slippage_rate)
             alloc_notional = cash * size_multiplier / (1 + config.fee_rate)
@@ -410,7 +430,9 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
                 position_signal_type = sell_signal.type
                 position_signal_index = i
                 position_stop_price = sell_signal.invalid_price
-                last_reduce_signal_time = None
+                last_reduce_signature = None
+                if sell_center_key is not None:
+                    consumed_sell_center_keys.add(sell_center_key)
 
     # 最后一个bar补权益
     if bars_main:

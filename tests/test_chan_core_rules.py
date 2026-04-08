@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from ai_trader.chan.core.center import build_zhongshus, build_zhongshus_from_bis
-from ai_trader.chan.core.buy_sell_points import generate_signals
+from ai_trader.chan.core.buy_sell_points import decide_action, generate_signals
+from ai_trader.chan.config import get_chan_config
 from ai_trader.chan.core.divergence import (
     DivergenceCandidate,
     detect_divergence_candidates,
@@ -14,7 +16,9 @@ from ai_trader.chan.core.fractal import detect_fractals
 from ai_trader.chan.core.include import merge_inclusions
 from ai_trader.chan.core.segment import build_segments
 from ai_trader.chan.core.stroke import build_bis
-from ai_trader.chan.engine import _fresh_signals, generate_signal
+from ai_trader.chan.core.trend_phase import infer_market_state
+from ai_trader.chan.core.trend_phase import infer_trend_type
+from ai_trader.chan.engine import _fresh_signals, _sub_interval_confirmed, generate_signal
 from ai_trader.types import (
     Bar,
     Bi,
@@ -56,17 +60,27 @@ class ChanCoreRulesTest(unittest.TestCase):
         )
 
     def _mk_divergence(
-        self, signal_type: str, idx: int, invalid_price: float
+        self,
+        signal_type: str,
+        idx: int,
+        invalid_price: float,
+        mode: str = "trend",
+        anchor_center_start_index: int | None = None,
+        anchor_center_end_index: int | None = None,
+        anchor_center_available_time=None,
     ) -> DivergenceCandidate:
         return DivergenceCandidate(
             signal_type=signal_type,
-            mode="trend",
+            mode=mode,
             confidence=0.60,
             trigger=f"{signal_type} trigger",
             invalid_if=f"{signal_type} invalid",
             invalid_price=invalid_price,
             event_time=self._t(idx),
             available_time=self._t(idx),
+            anchor_center_start_index=anchor_center_start_index,
+            anchor_center_end_index=anchor_center_end_index,
+            anchor_center_available_time=anchor_center_available_time,
         )
 
     def test_merge_inclusions_strict_sequence(self) -> None:
@@ -122,6 +136,15 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertEqual(seg_yes[0].status, "confirmed")
         self.assertEqual(seg_yes[0].end_index, bis_with_confirm[3].end_index)
 
+    def test_segment_requires_initial_three_bi_overlap(self) -> None:
+        bis = [
+            self._mk_bi(0, "up", 100, 110),
+            self._mk_bi(1, "down", 125, 118),
+            self._mk_bi(2, "up", 130, 142),
+        ]
+
+        self.assertEqual(build_segments(bis, require_case2_confirmation=True), [])
+
     def test_b2_requires_first_pullback_after_b1_to_hold(self) -> None:
         signals = generate_signals(
             divergence_candidates=[self._mk_divergence("B1", 2, 95.0)],
@@ -141,6 +164,141 @@ class ChanCoreRulesTest(unittest.TestCase):
         )
 
         self.assertNotIn("B2", {item.type for item in signals})
+
+    def test_b2_emits_on_first_pullback_holding_b1_low_and_reconfirming(self) -> None:
+        signals = generate_signals(
+            divergence_candidates=[
+                self._mk_divergence(
+                    "B1",
+                    2,
+                    95.0,
+                    anchor_center_start_index=0,
+                    anchor_center_end_index=2,
+                    anchor_center_available_time=self._t(2),
+                )
+            ],
+            bis_sub=[
+                self._mk_bi(3, "up", 96, 103),
+                self._mk_bi(4, "down", 103, 97),
+                self._mk_bi(5, "up", 97, 105),
+            ],
+            segments_sub=[],
+            zhongshu_main=None,
+            market_state=MarketState(trend_type="down"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+        )
+
+        b2 = next(item for item in signals if item.type == "B2")
+        self.assertEqual(b2.event_time, self._t(6))
+        self.assertEqual(b2.available_time, self._t(6))
+        self.assertEqual(b2.invalid_price, 95.0)
+        self.assertEqual(b2.anchor_center_start_index, 0)
+        self.assertEqual(b2.anchor_center_end_index, 2)
+        self.assertEqual(b2.anchor_center_available_time, self._t(2))
+
+    def test_b2_not_emitted_after_sub_level_new_center_confirms(self) -> None:
+        late_center = Zhongshu(
+            zd=96.0,
+            zg=101.0,
+            gg=105.0,
+            dd=92.0,
+            g=101.0,
+            d=96.0,
+            start_index=4,
+            end_index=6,
+            event_time=self._t(6),
+            available_time=self._t(6),
+            origin_available_time=self._t(6),
+            evolution="newborn",
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[self._mk_divergence("B1", 2, 95.0)],
+            bis_sub=[
+                self._mk_bi(3, "up", 96, 103),
+                self._mk_bi(4, "down", 103, 97),
+                self._mk_bi(5, "up", 97, 105),
+            ],
+            segments_sub=[],
+            zhongshus_sub=[late_center],
+            zhongshu_main=None,
+            market_state=MarketState(trend_type="down"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+        )
+
+        self.assertNotIn("B2", {item.type for item in signals})
+
+    def test_b2_keeps_window_open_during_same_center_extension(self) -> None:
+        extension_center = Zhongshu(
+            zd=96.0,
+            zg=101.0,
+            gg=105.0,
+            dd=92.0,
+            g=101.0,
+            d=96.0,
+            start_index=1,
+            end_index=6,
+            event_time=self._t(6),
+            available_time=self._t(6),
+            origin_available_time=self._t(1),
+            evolution="extension",
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[self._mk_divergence("B1", 2, 95.0)],
+            bis_sub=[
+                self._mk_bi(3, "up", 96, 103),
+                self._mk_bi(4, "down", 103, 97),
+                self._mk_bi(5, "up", 97, 105),
+            ],
+            segments_sub=[],
+            zhongshus_sub=[extension_center],
+            zhongshu_main=None,
+            market_state=MarketState(trend_type="down"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+        )
+
+        self.assertIn("B2", {item.type for item in signals})
+
+    def test_s2_not_emitted_after_sub_level_new_center_confirms(self) -> None:
+        late_center = Zhongshu(
+            zd=99.0,
+            zg=104.0,
+            gg=108.0,
+            dd=95.0,
+            g=104.0,
+            d=99.0,
+            start_index=4,
+            end_index=6,
+            event_time=self._t(6),
+            available_time=self._t(6),
+            origin_available_time=self._t(6),
+            evolution="newborn",
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[self._mk_divergence("S1", 2, 105.0)],
+            bis_sub=[
+                self._mk_bi(3, "down", 104, 97),
+                self._mk_bi(4, "up", 97, 102),
+                self._mk_bi(5, "down", 102, 95),
+            ],
+            segments_sub=[],
+            zhongshus_sub=[late_center],
+            zhongshu_main=None,
+            market_state=MarketState(trend_type="up"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+        )
+
+        self.assertNotIn("S2", {item.type for item in signals})
 
     def test_b3_requires_sub_level_departure_and_first_pullback(self) -> None:
         zs = Zhongshu(
@@ -173,7 +331,7 @@ class ChanCoreRulesTest(unittest.TestCase):
 
         self.assertIn("B3", {item.type for item in signals})
 
-    def test_b3_can_use_recent_center_overlap_even_if_center_available_later(
+    def test_b3_not_emitted_if_center_available_later_than_pullback(
         self,
     ) -> None:
         zs = Zhongshu(
@@ -204,7 +362,7 @@ class ChanCoreRulesTest(unittest.TestCase):
             transitional_confidence_cap=0.60,
         )
 
-        self.assertIn("B3", {item.type for item in signals})
+        self.assertNotIn("B3", {item.type for item in signals})
 
     def test_b3_not_emitted_without_first_pullback_confirmation(self) -> None:
         zs = Zhongshu(
@@ -233,7 +391,78 @@ class ChanCoreRulesTest(unittest.TestCase):
 
         self.assertNotIn("B3", {item.type for item in signals})
 
-    def test_generate_signal_waits_for_center_confirmation_before_b3_is_fresh(
+    def test_b3_uses_first_pullback_not_later_one(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[],
+            bis_sub=[],
+            segments_sub=[
+                self._mk_segment(1, "down", 103.0, 99.0),
+                self._mk_segment(2, "up", 108.0, 100.0),
+                self._mk_segment(3, "down", 107.0, 103.0),
+                self._mk_segment(4, "up", 112.0, 104.0),
+                self._mk_segment(5, "down", 111.0, 105.0),
+            ],
+            zhongshu_main=zs,
+            market_state=MarketState(trend_type="up"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+        )
+
+        b3 = next(item for item in signals if item.type == "B3")
+        self.assertEqual(b3.event_time, self._t(5))
+        self.assertEqual(b3.available_time, self._t(5))
+        self.assertEqual(b3.anchor_center_start_index, 0)
+        self.assertEqual(b3.anchor_center_end_index, 2)
+        self.assertEqual(b3.anchor_center_available_time, self._t(2))
+
+    def test_b3_not_emitted_when_first_pullback_returns_to_center(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[],
+            bis_sub=[],
+            segments_sub=[
+                self._mk_segment(1, "down", 103.0, 99.0),
+                self._mk_segment(2, "up", 108.0, 100.0),
+                self._mk_segment(3, "down", 107.0, 101.0),
+                self._mk_segment(4, "up", 112.0, 104.0),
+                self._mk_segment(5, "down", 111.0, 105.0),
+            ],
+            zhongshu_main=zs,
+            market_state=MarketState(trend_type="up"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+        )
+
+        self.assertNotIn("B3", {item.type for item in signals})
+
+    def test_generate_signal_does_not_emit_b3_if_center_confirms_after_pullback(
         self,
     ) -> None:
         zs = Zhongshu(
@@ -291,9 +520,42 @@ class ChanCoreRulesTest(unittest.TestCase):
         )
 
         decision = generate_signal(snapshot)
-        self.assertIn("B3", {item.type for item in decision.signals})
-        self.assertEqual(decision.signals[0].available_time, self._t(20))
-        self.assertEqual(decision.action.decision, "buy")
+        self.assertNotIn("B3", {item.type for item in decision.signals})
+        self.assertEqual(decision.action.decision, "hold")
+
+    def test_b3_not_emitted_if_pullback_precedes_origin_center_confirmation(
+        self,
+    ) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(20),
+            origin_available_time=self._t(6),
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[],
+            bis_sub=[],
+            segments_sub=[
+                self._mk_segment(2, "down", 103.0, 99.0),
+                self._mk_segment(3, "up", 108.0, 100.0),
+                self._mk_segment(4, "down", 107.0, 103.0),
+            ],
+            zhongshu_main=zs,
+            market_state=MarketState(trend_type="up"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+        )
+
+        self.assertNotIn("B3", {item.type for item in signals})
 
     def test_fresh_signals_use_previous_raw_main_bar_time(self) -> None:
         signal = Signal(
@@ -376,6 +638,934 @@ class ChanCoreRulesTest(unittest.TestCase):
 
         self.assertEqual(divergence, [])
 
+    def test_strict_mode_skips_consolidation_divergence_as_b1(self) -> None:
+        bis = [
+            self._mk_bi(0, "down", 120, 110),
+            self._mk_bi(1, "up", 110, 116),
+            self._mk_bi(2, "down", 116, 106),
+            self._mk_bi(3, "up", 106, 112),
+            self._mk_bi(4, "down", 112, 102),
+        ]
+        macd = [
+            MACDPoint(time=self._t(1), dif=-3.0, dea=-2.0, hist=-8.0),
+            MACDPoint(time=self._t(3), dif=-2.0, dea=-1.5, hist=-4.0),
+            MACDPoint(time=self._t(5), dif=-1.0, dea=-0.8, hist=-2.0),
+        ]
+
+        divergence = detect_divergence_candidates(
+            bis=bis,
+            zhongshu_count=1,
+            trend_type="down",
+            macd=macd,
+            threshold=0.10,
+            zhongshus=[],
+            allow_consolidation_fallback=False,
+        )
+
+        self.assertEqual(divergence, [])
+
+    def test_consolidation_divergence_requires_reentry_to_center_between_departures(
+        self,
+    ) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+        bis = [
+            self._mk_bi(2, "down", 101, 96),
+            self._mk_bi(3, "up", 96, 97),
+            self._mk_bi(4, "down", 100, 94),
+        ]
+        macd = [
+            MACDPoint(time=self._t(3), dif=-2.0, dea=-1.0, hist=-8.0),
+            MACDPoint(time=self._t(5), dif=-1.0, dea=-0.8, hist=-4.0),
+        ]
+
+        divergence = detect_divergence_candidates(
+            bis=bis,
+            zhongshu_count=1,
+            trend_type="range",
+            macd=macd,
+            threshold=0.10,
+            zhongshus=[zs],
+            allow_consolidation_fallback=True,
+            consolidation_anchor=zs,
+        )
+
+        self.assertEqual(divergence, [])
+
+    def test_consolidation_divergence_detects_b1_inside_single_center(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+        bis = [
+            self._mk_bi(2, "down", 101, 96),
+            self._mk_bi(3, "up", 96, 101),
+            self._mk_bi(4, "down", 100, 94),
+        ]
+        macd = [
+            MACDPoint(time=self._t(3), dif=-2.0, dea=-1.0, hist=-8.0),
+            MACDPoint(time=self._t(5), dif=-1.0, dea=-0.8, hist=-4.0),
+        ]
+
+        divergence = detect_divergence_candidates(
+            bis=bis,
+            zhongshu_count=1,
+            trend_type="range",
+            macd=macd,
+            threshold=0.10,
+            zhongshus=[zs],
+            allow_consolidation_fallback=True,
+            consolidation_anchor=zs,
+        )
+
+        self.assertEqual(len(divergence), 1)
+        self.assertEqual(divergence[0].signal_type, "B1")
+        self.assertEqual(divergence[0].mode, "consolidation")
+        self.assertIn("盘整背驰", divergence[0].trigger)
+        self.assertEqual(divergence[0].anchor_center_start_index, 0)
+        self.assertEqual(divergence[0].anchor_center_end_index, 2)
+        self.assertEqual(divergence[0].anchor_center_available_time, self._t(2))
+
+    def test_trend_divergence_c_leg_stops_before_next_center_boundary(self) -> None:
+        bis = [
+            self._mk_bi(0, "down", 120, 90),
+            self._mk_bi(1, "up", 90, 112),
+            self._mk_bi(2, "down", 112, 101),
+            self._mk_bi(3, "up", 101, 107),
+            self._mk_bi(4, "down", 107, 102),
+            self._mk_bi(5, "up", 102, 110),
+            self._mk_bi(6, "down", 110, 96),
+            self._mk_bi(7, "up", 96, 100),
+            self._mk_bi(8, "down", 100, 88),
+            self._mk_bi(9, "up", 88, 94),
+            self._mk_bi(10, "down", 94, 90),
+            self._mk_bi(11, "up", 90, 96),
+            self._mk_bi(12, "down", 96, 91),
+            self._mk_bi(13, "up", 91, 95),
+            self._mk_bi(14, "down", 95, 92),
+            self._mk_bi(15, "up", 92, 94),
+            self._mk_bi(16, "down", 94, 93),
+            self._mk_bi(17, "up", 93, 97),
+            self._mk_bi(18, "down", 97, 80),
+        ]
+        zhongshus = [
+            Zhongshu(
+                zd=102.0,
+                zg=107.0,
+                gg=112.0,
+                dd=101.0,
+                g=107.0,
+                d=102.0,
+                start_index=2,
+                end_index=5,
+                event_time=self._t(5),
+                available_time=self._t(5),
+            ),
+            Zhongshu(
+                zd=90.0,
+                zg=94.0,
+                gg=100.0,
+                dd=88.0,
+                g=94.0,
+                d=90.0,
+                start_index=8,
+                end_index=11,
+                event_time=self._t(11),
+                available_time=self._t(11),
+            ),
+            Zhongshu(
+                zd=93.0,
+                zg=94.0,
+                gg=95.0,
+                dd=92.0,
+                g=94.0,
+                d=93.0,
+                start_index=14,
+                end_index=17,
+                event_time=self._t(17),
+                available_time=self._t(17),
+            ),
+        ]
+        macd = [
+            MACDPoint(time=self._t(1), dif=-4.0, dea=-3.0, hist=-10.0),
+            MACDPoint(time=self._t(9), dif=0.0, dea=0.0, hist=0.0),
+            MACDPoint(time=self._t(13), dif=-2.0, dea=-1.0, hist=-3.0),
+            MACDPoint(time=self._t(19), dif=-1.0, dea=-0.5, hist=-1.0),
+        ]
+
+        divergence = detect_divergence_candidates(
+            bis=bis,
+            zhongshu_count=3,
+            trend_type="down",
+            macd=macd,
+            threshold=0.10,
+            zhongshus=zhongshus,
+        )
+
+        self.assertEqual(divergence, [])
+
+    def test_trend_divergence_detects_b1_from_bounded_c_leg(self) -> None:
+        bis = [
+            self._mk_bi(0, "down", 120, 90),
+            self._mk_bi(1, "up", 90, 112),
+            self._mk_bi(2, "down", 112, 101),
+            self._mk_bi(3, "up", 101, 107),
+            self._mk_bi(4, "down", 107, 102),
+            self._mk_bi(5, "up", 102, 110),
+            self._mk_bi(6, "down", 110, 96),
+            self._mk_bi(7, "up", 96, 100),
+            self._mk_bi(8, "down", 100, 88),
+            self._mk_bi(9, "up", 88, 94),
+            self._mk_bi(10, "down", 94, 90),
+            self._mk_bi(11, "up", 90, 96),
+            self._mk_bi(12, "down", 96, 84),
+            self._mk_bi(13, "up", 84, 92),
+        ]
+        zhongshus = [
+            Zhongshu(
+                zd=102.0,
+                zg=107.0,
+                gg=112.0,
+                dd=101.0,
+                g=107.0,
+                d=102.0,
+                start_index=2,
+                end_index=5,
+                event_time=self._t(5),
+                available_time=self._t(5),
+            ),
+            Zhongshu(
+                zd=90.0,
+                zg=94.0,
+                gg=100.0,
+                dd=88.0,
+                g=94.0,
+                d=90.0,
+                start_index=8,
+                end_index=11,
+                event_time=self._t(11),
+                available_time=self._t(11),
+            ),
+        ]
+        macd = [
+            MACDPoint(time=self._t(1), dif=-4.0, dea=-3.0, hist=-10.0),
+            MACDPoint(time=self._t(8), dif=0.0, dea=0.0, hist=0.0),
+            MACDPoint(time=self._t(13), dif=-1.5, dea=-1.0, hist=-4.0),
+        ]
+
+        divergence = detect_divergence_candidates(
+            bis=bis,
+            zhongshu_count=2,
+            trend_type="down",
+            macd=macd,
+            threshold=0.10,
+            zhongshus=zhongshus,
+        )
+
+        self.assertEqual(len(divergence), 1)
+        self.assertEqual(divergence[0].signal_type, "B1")
+        self.assertEqual(divergence[0].available_time, self._t(13))
+        self.assertEqual(divergence[0].anchor_center_start_index, 8)
+        self.assertEqual(divergence[0].anchor_center_end_index, 11)
+        self.assertEqual(divergence[0].anchor_center_available_time, self._t(11))
+
+    def test_strict_interval_set_requires_sub_confirmation_for_b1(self) -> None:
+        main_candidate = self._mk_divergence("B1", 8, 90.0)
+        zs = Zhongshu(
+            zd=95.0,
+            zg=100.0,
+            gg=105.0,
+            dd=90.0,
+            g=100.0,
+            d=95.0,
+            start_index=0,
+            end_index=3,
+            event_time=self._t(3),
+            available_time=self._t(3),
+        )
+        snapshot = SimpleNamespace(
+            bars_sub=[Bar(time=self._t(8), open=100, high=101, low=99, close=100)],
+            bis_sub=[],
+            segments_sub=[],
+            macd_sub=[MACDPoint(time=self._t(8), dif=0.0, dea=0.0, hist=-1.0)],
+            last_zhongshu_main=zs,
+            asof_time=self._t(8),
+        )
+
+        with unittest.mock.patch("ai_trader.chan.engine.build_zhongshus_from_bis", return_value=[zs, zs]), unittest.mock.patch(
+            "ai_trader.chan.engine.infer_market_state",
+            return_value=MarketState(trend_type="down", zhongshu_count=2),
+        ), unittest.mock.patch(
+            "ai_trader.chan.engine.detect_divergence_candidates",
+            return_value=[],
+        ):
+            filtered = _sub_interval_confirmed(
+                snapshot,
+                [main_candidate],
+                threshold=0.10,
+                cfg=SimpleNamespace(
+                    require_sub_interval_confirmation=True,
+                    missing_macd_penalty=0.10,
+                    transitional_confidence_cap=0.60,
+                ),
+            )
+
+        self.assertEqual(filtered, [])
+
+    def test_strict_interval_accepts_sub_b2_confirmation_for_b1(self) -> None:
+        main_candidate = self._mk_divergence("B1", 8, 90.0)
+        sub_b1 = self._mk_divergence("B1", 8, 91.0)
+        zs = Zhongshu(
+            zd=95.0,
+            zg=100.0,
+            gg=105.0,
+            dd=90.0,
+            g=100.0,
+            d=95.0,
+            start_index=0,
+            end_index=3,
+            event_time=self._t(3),
+            available_time=self._t(3),
+        )
+        snapshot = SimpleNamespace(
+            bars_sub=[Bar(time=self._t(11), open=98, high=100, low=97, close=99)],
+            bis_sub=[
+                self._mk_bi(8, "up", 91, 96),
+                self._mk_bi(9, "down", 96, 92),
+            ],
+            segments_sub=[],
+            macd_sub=[],
+            last_zhongshu_main=zs,
+            asof_time=self._t(11),
+        )
+
+        with unittest.mock.patch(
+            "ai_trader.chan.engine.build_zhongshus_from_bis",
+            return_value=[zs],
+        ), unittest.mock.patch(
+            "ai_trader.chan.engine.infer_market_state",
+            return_value=MarketState(trend_type="down", zhongshu_count=1),
+        ), unittest.mock.patch(
+            "ai_trader.chan.engine.detect_divergence_candidates",
+            return_value=[sub_b1],
+        ):
+            filtered = _sub_interval_confirmed(
+                snapshot,
+                [main_candidate],
+                threshold=0.10,
+                cfg=SimpleNamespace(
+                    require_sub_interval_confirmation=True,
+                    missing_macd_penalty=0.10,
+                    transitional_confidence_cap=0.60,
+                ),
+            )
+
+        self.assertEqual(filtered, [main_candidate])
+
+    def test_strict_interval_uses_candidate_anchor_center_time(self) -> None:
+        main_candidate = self._mk_divergence(
+            "B1",
+            8,
+            90.0,
+            anchor_center_start_index=0,
+            anchor_center_end_index=3,
+            anchor_center_available_time=self._t(3),
+        )
+        sub_b1 = self._mk_divergence("B1", 8, 91.0)
+        main_zs = Zhongshu(
+            zd=95.0,
+            zg=100.0,
+            gg=105.0,
+            dd=90.0,
+            g=100.0,
+            d=95.0,
+            start_index=10,
+            end_index=13,
+            event_time=self._t(13),
+            available_time=self._t(13),
+        )
+        sub_zs = Zhongshu(
+            zd=95.0,
+            zg=100.0,
+            gg=105.0,
+            dd=90.0,
+            g=100.0,
+            d=95.0,
+            start_index=0,
+            end_index=3,
+            event_time=self._t(3),
+            available_time=self._t(3),
+        )
+        snapshot = SimpleNamespace(
+            bars_sub=[Bar(time=self._t(11), open=98, high=100, low=97, close=99)],
+            bis_sub=[
+                self._mk_bi(8, "up", 91, 96),
+                self._mk_bi(9, "down", 96, 92),
+                self._mk_bi(10, "up", 92, 99),
+            ],
+            segments_sub=[],
+            macd_sub=[],
+            last_zhongshu_main=main_zs,
+            asof_time=self._t(11),
+        )
+
+        with unittest.mock.patch(
+            "ai_trader.chan.engine.build_zhongshus_from_bis",
+            return_value=[sub_zs],
+        ), unittest.mock.patch(
+            "ai_trader.chan.engine.infer_market_state",
+            return_value=MarketState(trend_type="down", zhongshu_count=1),
+        ), unittest.mock.patch(
+            "ai_trader.chan.engine.detect_divergence_candidates",
+            return_value=[sub_b1],
+        ):
+            filtered = _sub_interval_confirmed(
+                snapshot,
+                [main_candidate],
+                threshold=0.10,
+                cfg=SimpleNamespace(
+                    require_sub_interval_confirmation=True,
+                    missing_macd_penalty=0.10,
+                    transitional_confidence_cap=0.60,
+                ),
+            )
+
+        self.assertEqual(filtered, [main_candidate])
+
+    def test_consolidation_b1_requires_sub_b2_or_b3_not_raw_sub_b1(self) -> None:
+        main_candidate = self._mk_divergence("B1", 8, 90.0, mode="consolidation")
+        sub_b1 = self._mk_divergence("B1", 8, 91.0)
+        zs = Zhongshu(
+            zd=95.0,
+            zg=100.0,
+            gg=105.0,
+            dd=90.0,
+            g=100.0,
+            d=95.0,
+            start_index=0,
+            end_index=3,
+            event_time=self._t(3),
+            available_time=self._t(3),
+        )
+        snapshot = SimpleNamespace(
+            bars_sub=[Bar(time=self._t(11), open=98, high=100, low=97, close=99)],
+            bis_sub=[
+                self._mk_bi(8, "up", 91, 96),
+                self._mk_bi(9, "down", 96, 92),
+            ],
+            segments_sub=[],
+            macd_sub=[],
+            last_zhongshu_main=zs,
+            asof_time=self._t(11),
+        )
+
+        with unittest.mock.patch(
+            "ai_trader.chan.engine.build_zhongshus_from_bis",
+            return_value=[zs],
+        ), unittest.mock.patch(
+            "ai_trader.chan.engine.infer_market_state",
+            return_value=MarketState(trend_type="down", zhongshu_count=1),
+        ), unittest.mock.patch(
+            "ai_trader.chan.engine.detect_divergence_candidates",
+            return_value=[sub_b1],
+        ):
+            filtered = _sub_interval_confirmed(
+                snapshot,
+                [main_candidate],
+                threshold=0.10,
+                cfg=SimpleNamespace(
+                    require_sub_interval_confirmation=True,
+                    missing_macd_penalty=0.10,
+                    transitional_confidence_cap=0.60,
+                ),
+            )
+
+        self.assertEqual(filtered, [])
+
+    def test_consolidation_b1_accepts_sub_b2_confirmation(self) -> None:
+        main_candidate = self._mk_divergence("B1", 8, 90.0, mode="consolidation")
+        sub_b1 = self._mk_divergence("B1", 8, 91.0)
+        zs = Zhongshu(
+            zd=95.0,
+            zg=100.0,
+            gg=105.0,
+            dd=90.0,
+            g=100.0,
+            d=95.0,
+            start_index=0,
+            end_index=3,
+            event_time=self._t(3),
+            available_time=self._t(3),
+        )
+        snapshot = SimpleNamespace(
+            bars_sub=[Bar(time=self._t(11), open=98, high=100, low=97, close=99)],
+            bis_sub=[
+                self._mk_bi(8, "up", 91, 96),
+                self._mk_bi(9, "down", 96, 92),
+                self._mk_bi(10, "up", 92, 99),
+            ],
+            segments_sub=[],
+            macd_sub=[],
+            last_zhongshu_main=zs,
+            asof_time=self._t(11),
+        )
+
+        with unittest.mock.patch(
+            "ai_trader.chan.engine.build_zhongshus_from_bis",
+            return_value=[zs],
+        ), unittest.mock.patch(
+            "ai_trader.chan.engine.infer_market_state",
+            return_value=MarketState(trend_type="down", zhongshu_count=1),
+        ), unittest.mock.patch(
+            "ai_trader.chan.engine.detect_divergence_candidates",
+            return_value=[sub_b1],
+        ):
+            filtered = _sub_interval_confirmed(
+                snapshot,
+                [main_candidate],
+                threshold=0.10,
+                cfg=SimpleNamespace(
+                    require_sub_interval_confirmation=True,
+                    missing_macd_penalty=0.10,
+                    transitional_confidence_cap=0.60,
+                ),
+            )
+
+        self.assertEqual(filtered, [main_candidate])
+
+    def test_strict_interval_accepts_structural_b3_without_sub_macd(self) -> None:
+        main_candidate = self._mk_divergence("B1", 4, 90.0)
+        main_zs = Zhongshu(
+            zd=95.0,
+            zg=100.0,
+            gg=105.0,
+            dd=90.0,
+            g=100.0,
+            d=95.0,
+            start_index=0,
+            end_index=3,
+            event_time=self._t(3),
+            available_time=self._t(3),
+        )
+        sub_zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+        snapshot = SimpleNamespace(
+            bars_sub=[Bar(time=self._t(8), open=104, high=106, low=103, close=105)],
+            bis_sub=[],
+            segments_sub=[
+                self._mk_segment(4, "down", 103.0, 99.0),
+                self._mk_segment(5, "up", 108.0, 100.0),
+                self._mk_segment(6, "down", 107.0, 103.0),
+            ],
+            macd_sub=[],
+            last_zhongshu_main=main_zs,
+            asof_time=self._t(8),
+        )
+
+        with unittest.mock.patch(
+            "ai_trader.chan.engine.build_zhongshus_from_bis",
+            return_value=[sub_zs],
+        ), unittest.mock.patch(
+            "ai_trader.chan.engine.infer_market_state",
+            return_value=MarketState(trend_type="up", zhongshu_count=1),
+        ), unittest.mock.patch(
+            "ai_trader.chan.engine.detect_divergence_candidates",
+            return_value=[],
+        ):
+            filtered = _sub_interval_confirmed(
+                snapshot,
+                [main_candidate],
+                threshold=0.10,
+                cfg=SimpleNamespace(
+                    require_sub_interval_confirmation=True,
+                    missing_macd_penalty=0.10,
+                    transitional_confidence_cap=0.60,
+                ),
+            )
+
+        self.assertEqual(filtered, [main_candidate])
+
+    def test_market_state_requires_post_center_segments_for_transitional(self) -> None:
+        zs = Zhongshu(
+            zd=95.0,
+            zg=100.0,
+            gg=105.0,
+            dd=90.0,
+            g=100.0,
+            d=95.0,
+            start_index=0,
+            end_index=3,
+            event_time=self._t(3),
+            available_time=self._t(3),
+        )
+        segments = [
+            Segment(
+                direction="up",
+                start_index=0,
+                end_index=3,
+                high=105.0,
+                low=95.0,
+                event_time=self._t(3),
+                available_time=self._t(3),
+                status="confirmed",
+            ),
+            Segment(
+                direction="down",
+                start_index=4,
+                end_index=6,
+                high=103.0,
+                low=97.0,
+                event_time=self._t(4),
+                available_time=self._t(4),
+                status="confirmed",
+            ),
+        ]
+
+        state = infer_market_state(
+            bars_close=99.0,
+            bis=[],
+            segments=segments,
+            zhongshus=[zs],
+        )
+
+        self.assertEqual(state.phase, "consolidating")
+
+    def test_market_state_tracks_oscillation_zn_breakout(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=3,
+            event_time=self._t(3),
+            available_time=self._t(3),
+        )
+        segments = [
+            Segment(
+                direction="up",
+                start_index=0,
+                end_index=3,
+                high=104.0,
+                low=98.0,
+                event_time=self._t(3),
+                available_time=self._t(3),
+                status="confirmed",
+            ),
+            Segment(
+                direction="down",
+                start_index=4,
+                end_index=6,
+                high=103.0,
+                low=97.0,
+                event_time=self._t(4),
+                available_time=self._t(4),
+                status="confirmed",
+            ),
+            Segment(
+                direction="up",
+                start_index=7,
+                end_index=9,
+                high=110.0,
+                low=101.0,
+                event_time=self._t(5),
+                available_time=self._t(5),
+                status="confirmed",
+            ),
+        ]
+
+        state = infer_market_state(
+            bars_close=104.0,
+            bis=[],
+            segments=segments,
+            zhongshus=[zs],
+        )
+
+        oscillation = state.oscillation_state
+        self.assertEqual(oscillation["anchor_source"], "current_center")
+        self.assertEqual(oscillation["count"], 3)
+        self.assertEqual(oscillation["bias"], "strong")
+        self.assertEqual(oscillation["direction"], "rising")
+        self.assertEqual(oscillation["breakout"], "above_zg")
+        self.assertTrue(oscillation["first_breakout"])
+
+    def test_market_state_oscillation_limit_reached_after_nine_segments(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=3,
+            event_time=self._t(3),
+            available_time=self._t(3),
+        )
+        segments = [
+            Segment(
+                direction="up" if i % 2 == 0 else "down",
+                start_index=i * 3,
+                end_index=i * 3 + 2,
+                high=104.0 + (i % 3),
+                low=97.0 + (i % 2),
+                event_time=self._t(3 + i),
+                available_time=self._t(3 + i),
+                status="confirmed",
+            )
+            for i in range(10)
+        ]
+
+        state = infer_market_state(
+            bars_close=100.0,
+            bis=[],
+            segments=segments,
+            zhongshus=[zs],
+        )
+
+        oscillation = state.oscillation_state
+        self.assertEqual(oscillation["count"], 9)
+        self.assertEqual(oscillation["total_count"], 10)
+        self.assertTrue(oscillation["limit_reached"])
+
+    def test_trend_type_requires_two_same_direction_centers(self) -> None:
+        zs = [
+            Zhongshu(
+                zd=95.0,
+                zg=100.0,
+                gg=105.0,
+                dd=90.0,
+                g=100.0,
+                d=95.0,
+                start_index=0,
+                end_index=3,
+                event_time=self._t(3),
+                available_time=self._t(3),
+            )
+        ]
+        bis = [self._mk_bi(0, "up", 90, 110)]
+
+        self.assertEqual(infer_trend_type(110.0, bis, zs), "range")
+
+    def test_trend_type_keeps_latest_completed_trend_when_later_center_overlaps(self) -> None:
+        zhongshus = [
+            Zhongshu(
+                zd=95.0,
+                zg=100.0,
+                gg=100.0,
+                dd=90.0,
+                g=100.0,
+                d=95.0,
+                start_index=0,
+                end_index=3,
+                event_time=self._t(3),
+                available_time=self._t(3),
+            ),
+            Zhongshu(
+                zd=110.0,
+                zg=115.0,
+                gg=120.0,
+                dd=106.0,
+                g=115.0,
+                d=110.0,
+                start_index=4,
+                end_index=7,
+                event_time=self._t(7),
+                available_time=self._t(7),
+            ),
+            Zhongshu(
+                zd=112.0,
+                zg=114.0,
+                gg=118.0,
+                dd=109.0,
+                g=114.0,
+                d=112.0,
+                start_index=8,
+                end_index=11,
+                event_time=self._t(11),
+                available_time=self._t(11),
+                evolution="expansion",
+            ),
+        ]
+
+        state = infer_market_state(
+            bars_close=113.0,
+            bis=[],
+            segments=[],
+            zhongshus=zhongshus,
+        )
+
+        self.assertEqual(infer_trend_type(113.0, [], zhongshus), "up")
+        self.assertEqual(state.trend_type, "up")
+        self.assertEqual(state.walk_type, "consolidation")
+        self.assertEqual(state.phase, "transitional")
+
+    def test_transitional_wait_uses_zn_breakout_note_without_b3(self) -> None:
+        action, summary = decide_action(
+            signals=[],
+            market_state=MarketState(
+                trend_type="range",
+                phase="transitional",
+                oscillation_state={
+                    "anchor_source": "prior_trend_center",
+                    "anchor_start_index": 12,
+                    "z": 100.0,
+                    "latest_zn": 103.0,
+                    "count": 3,
+                    "total_count": 3,
+                    "bias": "strong",
+                    "direction": "rising",
+                    "breakout": "above_zg",
+                    "first_breakout": True,
+                    "limit_reached": False,
+                },
+            ),
+            conflict_level="low",
+            min_confidence=0.60,
+            chan_config=SimpleNamespace(
+                execution_buy_types=("B2", "B3"),
+                execution_reduce_types=("S2", "S3"),
+                execution_sell_types=(),
+                execution_buy_min_confidence=0.65,
+                execution_reduce_min_confidence=0.65,
+                require_non_high_conflict_buy=True,
+                reduce_only_on_high_conflict=True,
+            ),
+        )
+
+        self.assertEqual(action.decision, "wait")
+        self.assertIn("Zn", action.reason)
+        self.assertIn("中枢扩展", summary)
+
+    def test_generate_signal_in_strict_mode_emits_consolidation_b1_candidate(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+        snapshot = ChanSnapshot(
+            exchange="binance",
+            symbol="BTC/USDT",
+            timeframe_main="4h",
+            timeframe_sub="1h",
+            asof_time=self._t(5),
+            bars_main=[
+                Bar(time=self._t(4), open=100, high=101, low=95, close=96),
+                Bar(time=self._t(5), open=96, high=100, low=93, close=94),
+            ],
+            bars_sub=[],
+            macd_main=[
+                MACDPoint(time=self._t(3), dif=-2.0, dea=-1.0, hist=-8.0),
+                MACDPoint(time=self._t(5), dif=-1.0, dea=-0.8, hist=-4.0),
+            ],
+            macd_sub=[],
+            fractals_main=[],
+            fractals_sub=[],
+            bis_main=[
+                self._mk_bi(2, "down", 101, 96),
+                self._mk_bi(3, "up", 96, 101),
+                self._mk_bi(4, "down", 100, 94),
+            ],
+            bis_sub=[],
+            segments_main=[],
+            segments_sub=[],
+            previous_main_bar_time=self._t(4),
+            zhongshus_main=[zs],
+            zhongshus_sub=[],
+            last_zhongshu_main=zs,
+            trend_type_main="range",
+            market_state_main=MarketState(
+                trend_type="range",
+                walk_type="consolidation",
+                phase="consolidating",
+                zhongshu_count=1,
+                last_zhongshu={"zd": 98.0, "zg": 102.0, "gg": 110.0, "dd": 92.0},
+                current_stroke_dir="down",
+                current_segment_dir="down",
+                oscillation_state={
+                    "anchor_source": "current_center",
+                    "anchor_start_index": 0,
+                    "z": 100.0,
+                    "latest_zn": 97.0,
+                    "count": 3,
+                    "total_count": 3,
+                    "bias": "weak",
+                    "direction": "falling",
+                    "breakout": "below_zd",
+                    "first_breakout": True,
+                    "limit_reached": False,
+                },
+            ),
+            data_quality=DataQuality(status="ok", notes=""),
+        )
+
+        decision = generate_signal(snapshot, chan_config=get_chan_config("strict_kline8"))
+
+        signal_types = {item.type for item in decision.signals}
+        self.assertIn("B1", signal_types)
+        b1 = next(item for item in decision.signals if item.type == "B1")
+        self.assertIn("盘整背驰", b1.trigger)
+        self.assertEqual(b1.anchor_center_start_index, 0)
+        self.assertEqual(b1.anchor_center_end_index, 2)
+        self.assertEqual(b1.anchor_center_available_time, self._t(2))
+        self.assertEqual(decision.action.decision, "hold")
+
+    def test_orthodox_mode_keeps_b1_candidate_without_sub_confirmation(self) -> None:
+        main_candidate = self._mk_divergence("B1", 8, 90.0)
+        snapshot = SimpleNamespace(
+            bars_sub=[],
+            bis_sub=[],
+            segments_sub=[],
+            macd_sub=[],
+            last_zhongshu_main=None,
+        )
+
+        filtered = _sub_interval_confirmed(
+            snapshot,
+            [main_candidate],
+            threshold=0.10,
+            cfg=SimpleNamespace(require_sub_interval_confirmation=False),
+        )
+
+        self.assertEqual(filtered, [main_candidate])
+
     def test_bi_zhongshu_extension_shrinks_overlap_range(self) -> None:
         zhongshus = build_zhongshus_from_bis(
             [
@@ -401,12 +1591,15 @@ class ChanCoreRulesTest(unittest.TestCase):
         ]
 
         zhongshus = build_zhongshus(segments)
-        # After extension the first center covers segs 0-5.  The last
+        # After extension the first center covers segs 0-5. The last
         # candidate (segs 4-6) does not overlap the center interval but
-        # its wave range touches, so it triggers level expansion which
-        # *merges* the two centers into one larger center.
-        self.assertEqual(len(zhongshus), 1)
-        self.assertEqual(zhongshus[0].evolution, "expansion")
+        # its wave range touches, so it triggers level expansion. We keep
+        # the same-level center sequence and mark the newer center as
+        # "expansion" instead of collapsing everything into one giant center.
+        self.assertEqual(len(zhongshus), 2)
+        self.assertEqual(zhongshus[0].evolution, "extension")
+        self.assertEqual(zhongshus[1].evolution, "expansion")
+        self.assertEqual(zhongshus[1].start_index, 4)
 
     def test_conflict_high_forces_wait(self) -> None:
         t0 = self._t(0)
@@ -640,6 +1833,44 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertIn("S3", signal_types)
         self.assertEqual(decision.risk.conflict_level, "high")
         self.assertEqual(decision.action.decision, "reduce")
+
+    def test_s3_uses_first_pullback_not_later_one(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[],
+            bis_sub=[],
+            segments_sub=[
+                self._mk_segment(1, "up", 103.0, 99.0),
+                self._mk_segment(2, "down", 101.0, 96.0),
+                self._mk_segment(3, "up", 97.0, 93.0),
+                self._mk_segment(4, "down", 95.0, 90.0),
+                self._mk_segment(5, "up", 96.0, 91.0),
+            ],
+            zhongshu_main=zs,
+            market_state=MarketState(trend_type="down"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+        )
+
+        s3 = next(item for item in signals if item.type == "S3")
+        self.assertEqual(s3.event_time, self._t(5))
+        self.assertEqual(s3.available_time, self._t(5))
+        self.assertEqual(s3.anchor_center_start_index, 0)
+        self.assertEqual(s3.anchor_center_end_index, 2)
+        self.assertEqual(s3.anchor_center_available_time, self._t(2))
 
 
 if __name__ == "__main__":

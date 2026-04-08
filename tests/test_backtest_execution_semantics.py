@@ -31,8 +31,11 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
         self.bars_main = make_synthetic_bars(start=start, count=260, step_hours=4)
         self.bars_sub = make_synthetic_bars(start=start, count=1040, step_hours=1)
 
-    def _snapshot(self, asof_time):
-        return SimpleNamespace(asof_time=asof_time, last_zhongshu_main=None)
+    def _snapshot(self, asof_time, center_start_index: int | None = None):
+        zhongshu = None
+        if center_start_index is not None:
+            zhongshu = SimpleNamespace(start_index=center_start_index, available_time=asof_time)
+        return SimpleNamespace(asof_time=asof_time, last_zhongshu_main=zhongshu)
 
     def test_strict_reduce_signal_does_not_open_short(self) -> None:
         def fake_build_chan_state(*args, **kwargs):
@@ -176,6 +179,303 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
             )
 
         self.assertEqual(len(report.trades), 1)
+
+    def test_sell_can_close_long_without_opening_short_when_disabled(self) -> None:
+        buy_time = self.bars_main[120].time
+        sell_time = self.bars_main[121].time
+
+        def fake_build_chan_state(*args, **kwargs):
+            return self._snapshot(kwargs["asof_time"])
+
+        def fake_generate_signal(snapshot, **kwargs):
+            if snapshot.asof_time == buy_time:
+                signal = Signal(
+                    type="B3",
+                    level="main",
+                    trigger="b3",
+                    invalid_if="invalid",
+                    confidence=0.70,
+                    event_time=snapshot.asof_time,
+                    available_time=snapshot.asof_time,
+                    invalid_price=100.0,
+                )
+                return _decision(snapshot.asof_time, "buy", [signal])
+
+            if snapshot.asof_time == sell_time:
+                signal = Signal(
+                    type="S3",
+                    level="main",
+                    trigger="s3",
+                    invalid_if="invalid",
+                    confidence=0.70,
+                    event_time=snapshot.asof_time,
+                    available_time=snapshot.asof_time,
+                    invalid_price=120.0,
+                )
+                return _decision(snapshot.asof_time, "sell", [signal])
+
+            return _decision(snapshot.asof_time, "hold", [])
+
+        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
+            "ai_trader.backtest.engine.generate_signal",
+            side_effect=fake_generate_signal,
+        ):
+            report = run_backtest(
+                config=BacktestConfig(chan_mode="strict_kline8", allow_short_entries=False),
+                bars_main=self.bars_main,
+                bars_sub=self.bars_sub,
+            )
+
+        self.assertEqual(len(report.trades), 1)
+        self.assertEqual(report.trades[0].side, "long")
+        self.assertGreaterEqual(report.equity_curve[-1].cash, 0.0)
+
+    def test_fresh_reduce_signals_only_apply_once_per_position(self) -> None:
+        buy_time = self.bars_main[120].time
+        first_reduce_time = self.bars_main[121].time
+
+        def fake_build_chan_state(*args, **kwargs):
+            return self._snapshot(kwargs["asof_time"])
+
+        def fake_generate_signal(snapshot, **kwargs):
+            if snapshot.asof_time == buy_time:
+                signal = Signal(
+                    type="B2",
+                    level="sub",
+                    trigger="b2",
+                    invalid_if="invalid",
+                    confidence=0.70,
+                    event_time=snapshot.asof_time,
+                    available_time=snapshot.asof_time,
+                    invalid_price=100.0,
+                )
+                return _decision(snapshot.asof_time, "buy", [signal])
+
+            if snapshot.asof_time >= first_reduce_time:
+                signal = Signal(
+                    type="S3",
+                    level="main",
+                    trigger="s3",
+                    invalid_if="invalid",
+                    confidence=0.70,
+                    event_time=snapshot.asof_time,
+                    available_time=snapshot.asof_time,
+                    invalid_price=120.0,
+                )
+                return _decision(snapshot.asof_time, "reduce", [signal])
+
+            return _decision(snapshot.asof_time, "hold", [])
+
+        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
+            "ai_trader.backtest.engine.generate_signal",
+            side_effect=fake_generate_signal,
+        ):
+            report = run_backtest(
+                config=BacktestConfig(chan_mode="strict_kline8"),
+                bars_main=self.bars_main,
+                bars_sub=self.bars_sub,
+            )
+
+        self.assertEqual(len(report.trades), 1)
+        self.assertEqual(report.trades[0].entry_time, self.bars_main[121].time)
+        self.assertEqual(report.trades[0].exit_time, self.bars_main[122].time)
+
+    def test_same_main_center_only_allows_one_effective_b3_entry(self) -> None:
+        first_buy_time = self.bars_main[120].time
+        first_sell_time = self.bars_main[121].time
+        second_buy_time = self.bars_main[122].time
+        second_sell_time = self.bars_main[123].time
+
+        def fake_build_chan_state(*args, **kwargs):
+            asof_time = kwargs["asof_time"]
+            if asof_time in {first_buy_time, first_sell_time, second_buy_time, second_sell_time}:
+                return self._snapshot(asof_time, center_start_index=7)
+            return self._snapshot(asof_time)
+
+        def fake_generate_signal(snapshot, **kwargs):
+            if snapshot.asof_time in {first_buy_time, second_buy_time}:
+                signal = Signal(
+                    type="B3",
+                    level="main",
+                    trigger="b3",
+                    invalid_if="invalid",
+                    confidence=0.70,
+                    event_time=snapshot.asof_time,
+                    available_time=snapshot.asof_time,
+                    invalid_price=100.0,
+                )
+                return _decision(snapshot.asof_time, "buy", [signal])
+
+            if snapshot.asof_time in {first_sell_time, second_sell_time}:
+                signal = Signal(
+                    type="S3",
+                    level="main",
+                    trigger="s3",
+                    invalid_if="invalid",
+                    confidence=0.70,
+                    event_time=snapshot.asof_time,
+                    available_time=snapshot.asof_time,
+                    invalid_price=120.0,
+                )
+                return _decision(snapshot.asof_time, "sell", [signal])
+
+            return _decision(snapshot.asof_time, "hold", [])
+
+        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
+            "ai_trader.backtest.engine.generate_signal",
+            side_effect=fake_generate_signal,
+        ):
+            report = run_backtest(
+                config=BacktestConfig(chan_mode="orthodox_chan", allow_short_entries=False),
+                bars_main=self.bars_main,
+                bars_sub=self.bars_sub,
+            )
+
+        self.assertEqual(len(report.trades), 1)
+        self.assertEqual(report.trades[0].entry_time, self.bars_main[121].time)
+        self.assertEqual(report.trades[0].exit_time, self.bars_main[122].time)
+
+    def test_different_main_centers_can_each_trigger_one_effective_b3_entry(self) -> None:
+        first_buy_time = self.bars_main[120].time
+        first_sell_time = self.bars_main[121].time
+        second_buy_time = self.bars_main[122].time
+        second_sell_time = self.bars_main[123].time
+
+        def fake_build_chan_state(*args, **kwargs):
+            asof_time = kwargs["asof_time"]
+            if asof_time in {first_buy_time, first_sell_time}:
+                return self._snapshot(asof_time, center_start_index=7)
+            if asof_time in {second_buy_time, second_sell_time}:
+                return self._snapshot(asof_time, center_start_index=9)
+            return self._snapshot(asof_time)
+
+        def fake_generate_signal(snapshot, **kwargs):
+            if snapshot.asof_time in {first_buy_time, second_buy_time}:
+                signal = Signal(
+                    type="B3",
+                    level="main",
+                    trigger="b3",
+                    invalid_if="invalid",
+                    confidence=0.70,
+                    event_time=snapshot.asof_time,
+                    available_time=snapshot.asof_time,
+                    invalid_price=100.0,
+                )
+                return _decision(snapshot.asof_time, "buy", [signal])
+
+            if snapshot.asof_time in {first_sell_time, second_sell_time}:
+                signal = Signal(
+                    type="S3",
+                    level="main",
+                    trigger="s3",
+                    invalid_if="invalid",
+                    confidence=0.70,
+                    event_time=snapshot.asof_time,
+                    available_time=snapshot.asof_time,
+                    invalid_price=120.0,
+                )
+                return _decision(snapshot.asof_time, "sell", [signal])
+
+            return _decision(snapshot.asof_time, "hold", [])
+
+        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
+            "ai_trader.backtest.engine.generate_signal",
+            side_effect=fake_generate_signal,
+        ):
+            report = run_backtest(
+                config=BacktestConfig(chan_mode="orthodox_chan", allow_short_entries=False),
+                bars_main=self.bars_main,
+                bars_sub=self.bars_sub,
+            )
+
+        self.assertEqual(len(report.trades), 2)
+        self.assertEqual(report.trades[0].entry_time, self.bars_main[121].time)
+        self.assertEqual(report.trades[1].entry_time, self.bars_main[123].time)
+
+    def test_b3_execution_uses_signal_anchor_center_not_snapshot_last_center(self) -> None:
+        first_buy_time = self.bars_main[120].time
+        first_sell_time = self.bars_main[121].time
+        second_buy_time = self.bars_main[122].time
+        second_sell_time = self.bars_main[123].time
+
+        def fake_build_chan_state(*args, **kwargs):
+            asof_time = kwargs["asof_time"]
+            if asof_time in {first_buy_time, first_sell_time, second_buy_time, second_sell_time}:
+                return self._snapshot(asof_time, center_start_index=7)
+            return self._snapshot(asof_time)
+
+        def fake_generate_signal(snapshot, **kwargs):
+            if snapshot.asof_time == first_buy_time:
+                signal = Signal(
+                    type="B3",
+                    level="main",
+                    trigger="b3",
+                    invalid_if="invalid",
+                    confidence=0.70,
+                    event_time=snapshot.asof_time,
+                    available_time=snapshot.asof_time,
+                    invalid_price=100.0,
+                    anchor_center_start_index=7,
+                )
+                return _decision(snapshot.asof_time, "buy", [signal])
+
+            if snapshot.asof_time == second_buy_time:
+                signal = Signal(
+                    type="B3",
+                    level="main",
+                    trigger="b3",
+                    invalid_if="invalid",
+                    confidence=0.70,
+                    event_time=snapshot.asof_time,
+                    available_time=snapshot.asof_time,
+                    invalid_price=100.0,
+                    anchor_center_start_index=9,
+                )
+                return _decision(snapshot.asof_time, "buy", [signal])
+
+            if snapshot.asof_time == first_sell_time:
+                signal = Signal(
+                    type="S3",
+                    level="main",
+                    trigger="s3",
+                    invalid_if="invalid",
+                    confidence=0.70,
+                    event_time=snapshot.asof_time,
+                    available_time=snapshot.asof_time,
+                    invalid_price=120.0,
+                    anchor_center_start_index=7,
+                )
+                return _decision(snapshot.asof_time, "sell", [signal])
+
+            if snapshot.asof_time == second_sell_time:
+                signal = Signal(
+                    type="S3",
+                    level="main",
+                    trigger="s3",
+                    invalid_if="invalid",
+                    confidence=0.70,
+                    event_time=snapshot.asof_time,
+                    available_time=snapshot.asof_time,
+                    invalid_price=120.0,
+                    anchor_center_start_index=9,
+                )
+                return _decision(snapshot.asof_time, "sell", [signal])
+
+            return _decision(snapshot.asof_time, "hold", [])
+
+        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
+            "ai_trader.backtest.engine.generate_signal",
+            side_effect=fake_generate_signal,
+        ):
+            report = run_backtest(
+                config=BacktestConfig(chan_mode="orthodox_chan", allow_short_entries=False),
+                bars_main=self.bars_main,
+                bars_sub=self.bars_sub,
+            )
+
+        self.assertEqual(len(report.trades), 2)
+        self.assertEqual(report.trades[0].entry_time, self.bars_main[121].time)
+        self.assertEqual(report.trades[1].entry_time, self.bars_main[123].time)
 
 
 if __name__ == "__main__":

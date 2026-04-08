@@ -19,8 +19,32 @@ def _apply_phase_cap(signal_type: str, confidence: float, phase: str, cap: float
     return min(confidence, cap)
 
 
-def _confirmed_bis_after(bis_sub: list[Bi], anchor_time) -> list[Bi]:
-    return [item for item in bis_sub if item.status == "confirmed" and item.available_time > anchor_time]
+def _confirmed_bis_in_b2_window(
+    bis_sub: list[Bi],
+    anchor_time,
+    cutoff_time,
+) -> list[Bi]:
+    return [
+        item
+        for item in bis_sub
+        if item.status == "confirmed"
+        and item.available_time > anchor_time
+        and (cutoff_time is None or item.available_time < cutoff_time)
+    ]
+
+
+def _first_new_sub_center_after(
+    zhongshus_sub: list[Zhongshu],
+    anchor_time,
+):
+    times = [
+        item.origin_available_time or item.available_time
+        for item in zhongshus_sub
+        if (item.origin_available_time or item.available_time) > anchor_time
+    ]
+    if not times:
+        return None
+    return min(times)
 
 
 def _confirmed_segments(segments_sub: list[Segment]) -> list[Segment]:
@@ -31,13 +55,63 @@ def _segment_overlaps_center(segment: Segment, zhongshu: Zhongshu) -> bool:
     return segment.high >= zhongshu.zd and segment.low <= zhongshu.zg
 
 
+def _first_pullback_after_departure(
+    segments_sub: list[Segment],
+    zhongshu: Zhongshu,
+    departure_direction: str,
+) -> Segment | None:
+    center_confirmed_at = zhongshu.origin_available_time or zhongshu.available_time
+    confirmed = [
+        item
+        for item in _confirmed_segments(segments_sub)
+        if item.available_time >= center_confirmed_at
+    ]
+    if len(confirmed) < 2:
+        return None
+
+    pullback_direction = "down" if departure_direction == "up" else "up"
+
+    for pullback_idx in range(1, len(confirmed)):
+        pullback = confirmed[pullback_idx]
+        if pullback.direction != pullback_direction:
+            continue
+
+        departure_end_idx = pullback_idx - 1
+        departure_end = confirmed[departure_end_idx]
+        if departure_end.direction != departure_direction:
+            continue
+
+        if departure_direction == "up" and departure_end.high <= zhongshu.zg:
+            continue
+        if departure_direction == "down" and departure_end.low >= zhongshu.zd:
+            continue
+
+        departure_start_idx = departure_end_idx
+        while (
+            departure_start_idx > 0
+            and confirmed[departure_start_idx - 1].direction == departure_direction
+        ):
+            departure_start_idx -= 1
+
+        overlap_idx = departure_start_idx - 1
+        if overlap_idx < 0 or not _segment_overlaps_center(
+            confirmed[overlap_idx], zhongshu
+        ):
+            continue
+
+        return pullback
+
+    return None
+
+
 def _first_retrace_confirmation(
     bis_sub: list[Bi],
     anchor_time,
     departure_direction: str,
     retrace_direction: str,
+    cutoff_time=None,
 ) -> tuple[Bi, Bi] | None:
-    post = _confirmed_bis_after(bis_sub, anchor_time)
+    post = _confirmed_bis_in_b2_window(bis_sub, anchor_time, cutoff_time)
     if len(post) < 2:
         return None
 
@@ -58,12 +132,18 @@ def _first_retrace_confirmation(
     return None
 
 
-def _derive_b2(b1: Signal, bis_sub: list[Bi]) -> Signal | None:
+def _derive_b2(
+    b1: Signal,
+    bis_sub: list[Bi],
+    zhongshus_sub: list[Zhongshu],
+) -> Signal | None:
+    cutoff_time = _first_new_sub_center_after(zhongshus_sub, b1.available_time)
     sequence = _first_retrace_confirmation(
         bis_sub=bis_sub,
         anchor_time=b1.available_time,
         departure_direction="up",
         retrace_direction="down",
+        cutoff_time=cutoff_time,
     )
     if sequence is None:
         return None
@@ -82,15 +162,24 @@ def _derive_b2(b1: Signal, bis_sub: list[Bi]) -> Signal | None:
         event_time=confirm_bi.event_time,
         available_time=confirm_bi.available_time,
         invalid_price=b1.invalid_price,
+        anchor_center_start_index=b1.anchor_center_start_index,
+        anchor_center_end_index=b1.anchor_center_end_index,
+        anchor_center_available_time=b1.anchor_center_available_time,
     )
 
 
-def _derive_s2(s1: Signal, bis_sub: list[Bi]) -> Signal | None:
+def _derive_s2(
+    s1: Signal,
+    bis_sub: list[Bi],
+    zhongshus_sub: list[Zhongshu],
+) -> Signal | None:
+    cutoff_time = _first_new_sub_center_after(zhongshus_sub, s1.available_time)
     sequence = _first_retrace_confirmation(
         bis_sub=bis_sub,
         anchor_time=s1.available_time,
         departure_direction="down",
         retrace_direction="up",
+        cutoff_time=cutoff_time,
     )
     if sequence is None:
         return None
@@ -109,6 +198,9 @@ def _derive_s2(s1: Signal, bis_sub: list[Bi]) -> Signal | None:
         event_time=confirm_bi.event_time,
         available_time=confirm_bi.available_time,
         invalid_price=s1.invalid_price,
+        anchor_center_start_index=s1.anchor_center_start_index,
+        anchor_center_end_index=s1.anchor_center_end_index,
+        anchor_center_available_time=s1.anchor_center_available_time,
     )
 
 
@@ -116,82 +208,62 @@ def _derive_b3(segments_sub: list[Segment], zhongshu: Zhongshu | None) -> Signal
     if zhongshu is None:
         return None
 
-    confirmed = _confirmed_segments(segments_sub)
-    if len(confirmed) < 2:
+    pullback = _first_pullback_after_departure(
+        segments_sub=segments_sub,
+        zhongshu=zhongshu,
+        departure_direction="up",
+    )
+    if pullback is None:
+        return None
+    if pullback.low <= zhongshu.zg:
         return None
 
-    for pullback_idx in range(len(confirmed) - 1, 0, -1):
-        pullback = confirmed[pullback_idx]
-        if pullback.direction != "down" or pullback.low <= zhongshu.zg:
-            continue
-
-        departure_end_idx = pullback_idx - 1
-        departure_end = confirmed[departure_end_idx]
-        if departure_end.direction != "up" or departure_end.high <= zhongshu.zg:
-            continue
-
-        departure_start_idx = departure_end_idx
-        while departure_start_idx > 0 and confirmed[departure_start_idx - 1].direction == "up":
-            departure_start_idx -= 1
-
-        overlap_idx = departure_start_idx - 1
-        if overlap_idx < 0 or not _segment_overlaps_center(confirmed[overlap_idx], zhongshu):
-            continue
-
-        available_time = max(pullback.available_time, zhongshu.available_time)
-        return Signal(
-            type="B3",
-            level="main",
-            trigger="次级别向上离开中枢后，首次回抽未重新进入中枢",
-            invalid_if=f"价格跌回中枢上沿{zhongshu.zg:.2f}下方",
-            confidence=0.68,
-            event_time=pullback.event_time,
-            available_time=available_time,
-            invalid_price=zhongshu.zg,
-        )
-
-    return None
+    center_confirmed_at = zhongshu.origin_available_time or zhongshu.available_time
+    available_time = max(pullback.available_time, center_confirmed_at)
+    return Signal(
+        type="B3",
+        level="main",
+        trigger="次级别向上离开中枢后，首次回抽未重新进入中枢",
+        invalid_if=f"价格跌回中枢上沿{zhongshu.zg:.2f}下方",
+        confidence=0.68,
+        event_time=pullback.event_time,
+        available_time=available_time,
+        invalid_price=zhongshu.zg,
+        anchor_center_start_index=zhongshu.start_index,
+        anchor_center_end_index=zhongshu.end_index,
+        anchor_center_available_time=center_confirmed_at,
+    )
 
 
 def _derive_s3(segments_sub: list[Segment], zhongshu: Zhongshu | None) -> Signal | None:
     if zhongshu is None:
         return None
 
-    confirmed = _confirmed_segments(segments_sub)
-    if len(confirmed) < 2:
+    pullback = _first_pullback_after_departure(
+        segments_sub=segments_sub,
+        zhongshu=zhongshu,
+        departure_direction="down",
+    )
+    if pullback is None:
+        return None
+    if pullback.high >= zhongshu.zd:
         return None
 
-    for pullback_idx in range(len(confirmed) - 1, 0, -1):
-        pullback = confirmed[pullback_idx]
-        if pullback.direction != "up" or pullback.high >= zhongshu.zd:
-            continue
-
-        departure_end_idx = pullback_idx - 1
-        departure_end = confirmed[departure_end_idx]
-        if departure_end.direction != "down" or departure_end.low >= zhongshu.zd:
-            continue
-
-        departure_start_idx = departure_end_idx
-        while departure_start_idx > 0 and confirmed[departure_start_idx - 1].direction == "down":
-            departure_start_idx -= 1
-
-        overlap_idx = departure_start_idx - 1
-        if overlap_idx < 0 or not _segment_overlaps_center(confirmed[overlap_idx], zhongshu):
-            continue
-
-        available_time = max(pullback.available_time, zhongshu.available_time)
-        return Signal(
-            type="S3",
-            level="main",
-            trigger="次级别向下离开中枢后，首次反抽未重新进入中枢",
-            invalid_if=f"价格重新站回中枢下沿{zhongshu.zd:.2f}上方",
-            confidence=0.68,
-            event_time=pullback.event_time,
-            available_time=available_time,
-            invalid_price=zhongshu.zd,
-        )
-
-    return None
+    center_confirmed_at = zhongshu.origin_available_time or zhongshu.available_time
+    available_time = max(pullback.available_time, center_confirmed_at)
+    return Signal(
+        type="S3",
+        level="main",
+        trigger="次级别向下离开中枢后，首次反抽未重新进入中枢",
+        invalid_if=f"价格重新站回中枢下沿{zhongshu.zd:.2f}上方",
+        confidence=0.68,
+        event_time=pullback.event_time,
+        available_time=available_time,
+        invalid_price=zhongshu.zd,
+        anchor_center_start_index=zhongshu.start_index,
+        anchor_center_end_index=zhongshu.end_index,
+        anchor_center_available_time=center_confirmed_at,
+    )
 
 
 def generate_signals(
@@ -203,7 +275,9 @@ def generate_signals(
     macd_missing: bool,
     missing_macd_penalty: float,
     transitional_confidence_cap: float,
+    zhongshus_sub: list[Zhongshu] | None = None,
 ) -> list[Signal]:
+    zhongshus_sub = zhongshus_sub or []
     signals: list[Signal] = []
 
     for item in divergence_candidates:
@@ -217,6 +291,9 @@ def generate_signals(
                 event_time=item.event_time,
                 available_time=item.available_time,
                 invalid_price=item.invalid_price,
+                anchor_center_start_index=item.anchor_center_start_index,
+                anchor_center_end_index=item.anchor_center_end_index,
+                anchor_center_available_time=item.anchor_center_available_time,
             )
         )
 
@@ -224,11 +301,11 @@ def generate_signals(
     s1 = next((x for x in signals if x.type == "S1"), None)
 
     if b1 is not None:
-        b2 = _derive_b2(b1, bis_sub)
+        b2 = _derive_b2(b1, bis_sub, zhongshus_sub)
         if b2 is not None:
             signals.append(b2)
     if s1 is not None:
-        s2 = _derive_s2(s1, bis_sub)
+        s2 = _derive_s2(s1, bis_sub, zhongshus_sub)
         if s2 is not None:
             signals.append(s2)
 
@@ -279,9 +356,23 @@ def decide_action(
     best_b3 = _best_signal(signals, {"B3"}, min_confidence)
     best_s3 = _best_signal(signals, {"S3"}, min_confidence)
     has_turning_only = any(item.type in {"B1", "S1"} for item in signals)
+    oscillation = market_state.oscillation_state
+    oscillation_breakout = str(oscillation.get("breakout", "none"))
+    first_breakout = bool(oscillation.get("first_breakout", False))
+    limit_reached = bool(oscillation.get("limit_reached", False))
 
     if market_state.phase == "transitional":
         if best_b3 is None and best_s3 is None:
+            if oscillation_breakout in {"above_zg", "below_zd"} and first_breakout:
+                return (
+                    Action(decision="wait", reason="中阴阶段内Zn首次越界，先区分三买卖与中枢扩展"),
+                    "处于中阴阶段，Zn 已首次越界，需先区分第三类买卖点还是中枢扩展。",
+                )
+            if limit_reached:
+                return (
+                    Action(decision="wait", reason="中枢震荡段数已超过9，等待级别升级后的新结构"),
+                    "当前中枢震荡已超过 9 段，优先等待次级别升级后的新结构确认。",
+                )
             return Action(decision="wait", reason="中阴阶段默认等待新走势类型确认"), "处于中阴阶段，等待第三类买卖点确认后再操作。"
 
     if conflict_level == "high":

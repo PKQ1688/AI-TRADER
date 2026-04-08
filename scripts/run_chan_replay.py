@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeframe-sub", default="1h")
     parser.add_argument("--start", default="2024-01-01T00:00:00Z")
     parser.add_argument("--end", default="2025-12-31T23:59:59Z")
-    parser.add_argument("--chan-mode", default="strict_kline8", choices=("strict_kline8", "pragmatic"))
+    parser.add_argument("--chan-mode", default="strict_kline8", choices=("strict_kline8", "orthodox_chan", "pragmatic"))
     parser.add_argument("--warmup-bars", type=int, default=120)
     parser.add_argument(
         "--tail-bars",

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-Mode = Literal["strict_kline8", "pragmatic"]
+Mode = Literal["strict_kline8", "orthodox_chan", "pragmatic"]
 
 
 @dataclass(slots=True)
@@ -25,9 +25,24 @@ class ChanConfig:
     execution_reduce_min_confidence: float = 0.65
     require_non_high_conflict_buy: bool = True
     reduce_only_on_high_conflict: bool = True
+    require_sub_interval_confirmation: bool = True
+    allow_consolidation_divergence_fallback: bool = False
 
 
-STRICT_KLINE8 = ChanConfig()
+STRICT_KLINE8 = ChanConfig(
+    allow_consolidation_divergence_fallback=True,
+)
+ORTHODOX_CHAN = ChanConfig(
+    mode="orthodox_chan",
+    execution_buy_types=("B2", "B3"),
+    execution_reduce_types=("S1", "S2", "S3"),
+    execution_sell_types=("S2", "S3"),
+    execution_buy_min_confidence=0.65,
+    execution_reduce_min_confidence=0.60,
+    reduce_only_on_high_conflict=True,
+    require_sub_interval_confirmation=False,
+    allow_consolidation_divergence_fallback=True,
+)
 PRAGMATIC = ChanConfig(
     mode="pragmatic",
     min_main_bars=40,
@@ -44,8 +59,14 @@ PRAGMATIC = ChanConfig(
     execution_reduce_min_confidence=0.60,
     require_non_high_conflict_buy=False,
     reduce_only_on_high_conflict=False,
+    require_sub_interval_confirmation=False,
+    allow_consolidation_divergence_fallback=True,
 )
 
 
 def get_chan_config(mode: Mode = "strict_kline8") -> ChanConfig:
-    return STRICT_KLINE8 if mode == "strict_kline8" else PRAGMATIC
+    if mode == "strict_kline8":
+        return STRICT_KLINE8
+    if mode == "orthodox_chan":
+        return ORTHODOX_CHAN
+    return PRAGMATIC

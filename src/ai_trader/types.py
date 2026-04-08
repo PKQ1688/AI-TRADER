@@ -131,6 +131,7 @@ class Zhongshu:
     end_index: int
     event_time: datetime
     available_time: datetime
+    origin_available_time: datetime | None = None
     gg: float = 0.0
     dd: float = 0.0
     g: float = 0.0
@@ -141,6 +142,10 @@ class Zhongshu:
     def __post_init__(self) -> None:
         self.event_time = parse_utc_time(self.event_time)
         self.available_time = parse_utc_time(self.available_time)
+        if self.origin_available_time is None:
+            self.origin_available_time = self.available_time
+        else:
+            self.origin_available_time = parse_utc_time(self.origin_available_time)
         if self.gg == 0.0 and self.dd == 0.0:
             self.gg = self.zg
             self.dd = self.zd
@@ -159,10 +164,17 @@ class Signal:
     event_time: datetime
     available_time: datetime
     invalid_price: float | None = None
+    anchor_center_start_index: int | None = None
+    anchor_center_end_index: int | None = None
+    anchor_center_available_time: datetime | None = None
 
     def __post_init__(self) -> None:
         self.event_time = parse_utc_time(self.event_time)
         self.available_time = parse_utc_time(self.available_time)
+        if self.anchor_center_available_time is not None:
+            self.anchor_center_available_time = parse_utc_time(
+                self.anchor_center_available_time
+            )
         self.confidence = max(0.0, min(1.0, float(self.confidence)))
 
     def to_contract_dict(self) -> dict[str, Any]:
@@ -190,6 +202,21 @@ class MarketState:
     last_zhongshu: dict[str, float] = field(default_factory=lambda: {"zd": 0.0, "zg": 0.0, "gg": 0.0, "dd": 0.0})
     current_stroke_dir: Literal["up", "down"] = "up"
     current_segment_dir: Literal["up", "down"] = "up"
+    oscillation_state: dict[str, Any] = field(
+        default_factory=lambda: {
+            "anchor_source": "none",
+            "anchor_start_index": -1,
+            "z": 0.0,
+            "latest_zn": 0.0,
+            "count": 0,
+            "total_count": 0,
+            "bias": "none",
+            "direction": "none",
+            "breakout": "none",
+            "first_breakout": False,
+            "limit_reached": False,
+        }
+    )
 
 
 @dataclass(slots=True)
@@ -232,6 +259,7 @@ class SignalDecision:
                 "last_zhongshu": self.market_state.last_zhongshu,
                 "current_stroke_dir": self.market_state.current_stroke_dir,
                 "current_segment_dir": self.market_state.current_segment_dir,
+                "oscillation_state": self.market_state.oscillation_state,
             },
             "signals": [item.to_contract_dict() for item in self.signals],
             "action": asdict(self.action),
@@ -353,7 +381,7 @@ class BacktestConfig:
     symbol: str = "BTC/USDT"
     timeframe_main: str = "4h"
     timeframe_sub: str = "1h"
-    chan_mode: Literal["strict_kline8", "pragmatic"] = "strict_kline8"
+    chan_mode: Literal["strict_kline8", "orthodox_chan", "pragmatic"] = "strict_kline8"
     start_utc: str = "2022-02-10T00:00:00Z"
     end_utc: str = "2026-02-10T00:00:00Z"
     initial_capital: float = 100000.0
@@ -365,6 +393,7 @@ class BacktestConfig:
     drawdown_freeze_threshold: float = 0.18
     freeze_recovery_days: int = 21
     reduce_ratio: float = 0.50
+    allow_short_entries: bool = True
     benchmark: str = "time_matched_random"
     random_seed: int = 7
 

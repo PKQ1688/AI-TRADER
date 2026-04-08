@@ -145,16 +145,12 @@ def build_chan_state(
     zhongshus_main = build_zhongshus(segments_main)
     zhongshus_sub = build_zhongshus(segments_sub)
 
-    # Build bi-level zhongshus for divergence detection (correct level per kline8-18)
-    bi_zhongshus_main = build_zhongshus_from_bis(bis_main)
-
     normalized_macd_main = _normalize_macd(macd_main, raw_main)
     normalized_macd_sub = _normalize_macd(macd_sub, raw_sub)
 
     last_close = merged_main[-1].close if merged_main else 0.0
-    # Use bi-level zhongshus for trend inference (more granular, correct level)
     market_state = infer_market_state(
-        last_close, bis_main, segments_main, bi_zhongshus_main
+        last_close, bis_main, segments_main, zhongshus_main
     )
 
     return ChanSnapshot(
@@ -214,6 +210,110 @@ def _fresh_signals(snapshot: ChanSnapshot, signals):
     ]
 
 
+def _sub_interval_confirmed(
+    snapshot: ChanSnapshot,
+    main_candidates,
+    threshold: float,
+    cfg: ChanConfig,
+):
+    if not cfg.require_sub_interval_confirmation or not main_candidates or not snapshot.bars_sub:
+        return list(main_candidates)
+
+    sub_zhongshus = build_zhongshus_from_bis(snapshot.bis_sub)
+    if not sub_zhongshus:
+        return []
+
+    sub_state = infer_market_state(
+        snapshot.bars_sub[-1].close,
+        snapshot.bis_sub,
+        snapshot.segments_sub,
+        sub_zhongshus,
+    )
+    sub_anchor_start = int(sub_state.oscillation_state.get("anchor_start_index", -1))
+    sub_consolidation_anchor = next(
+        (item for item in sub_zhongshus if item.start_index == sub_anchor_start),
+        sub_zhongshus[-1],
+    )
+    sub_candidates = detect_divergence_candidates(
+        bis=snapshot.bis_sub,
+        zhongshu_count=sub_state.zhongshu_count,
+        trend_type=sub_state.trend_type,
+        macd=snapshot.macd_sub,
+        threshold=threshold,
+        zhongshus=sub_zhongshus,
+        allow_consolidation_fallback=getattr(
+            cfg, "allow_consolidation_divergence_fallback", False
+        ),
+        consolidation_anchor=sub_consolidation_anchor,
+    )
+    sub_signals = generate_signals(
+        divergence_candidates=sub_candidates,
+        bis_sub=snapshot.bis_sub,
+        segments_sub=snapshot.segments_sub,
+        zhongshus_sub=sub_zhongshus,
+        zhongshu_main=sub_zhongshus[-1],
+        market_state=sub_state,
+        macd_missing=len(snapshot.macd_sub) == 0,
+        missing_macd_penalty=cfg.missing_macd_penalty,
+        transitional_confidence_cap=cfg.transitional_confidence_cap,
+    )
+
+    snapshot_anchor_time = (
+        snapshot.last_zhongshu_main.available_time if snapshot.last_zhongshu_main else None
+    )
+    confirmed = []
+    for candidate in main_candidates:
+        if candidate.signal_type not in {"B1", "S1"}:
+            confirmed.append(candidate)
+            continue
+
+        if candidate.signal_type == "B1":
+            accepted_types = {"B2", "B3"} if candidate.mode == "consolidation" else {"B1", "B2", "B3"}
+        else:
+            accepted_types = {"S2", "S3"} if candidate.mode == "consolidation" else {"S1", "S2", "S3"}
+
+        candidate_anchor_time = (
+            candidate.anchor_center_available_time
+            if getattr(candidate, "anchor_center_available_time", None) is not None
+            else snapshot_anchor_time
+        )
+        lower_bound = max(
+            item for item in (candidate_anchor_time, candidate.event_time) if item is not None
+        )
+        matched = any(
+            item.type in accepted_types
+            and lower_bound <= item.available_time <= snapshot.asof_time
+            for item in sub_signals
+        )
+        if matched:
+            confirmed.append(candidate)
+
+    return confirmed
+
+
+def _oscillation_note(market_state: MarketState) -> str:
+    oscillation = market_state.oscillation_state
+    if not oscillation or int(oscillation.get("count", 0)) <= 0:
+        return ""
+
+    breakout = str(oscillation.get("breakout", "none"))
+    if breakout in {"above_zg", "below_zd"}:
+        side = "上沿" if breakout == "above_zg" else "下沿"
+        if bool(oscillation.get("first_breakout", False)):
+            return f"Zn 首次越过中枢{side}，需区分第三类买卖点与中枢扩展"
+        return f"Zn 仍处于越过中枢{side}后的震荡延续中"
+
+    if bool(oscillation.get("limit_reached", False)):
+        return "中枢震荡段数已超过 9，提防次级别升级"
+
+    bias_map = {"strong": "偏强", "weak": "偏弱", "neutral": "中性"}
+    bias = bias_map.get(str(oscillation.get("bias", "none")))
+    if bias:
+        return f"Zn 当前{bias}"
+
+    return ""
+
+
 def generate_signal(
     snapshot: ChanSnapshot,
     macd_divergence_threshold: float = 0.10,
@@ -243,23 +343,32 @@ def generate_signal(
             cn_summary="当前数据不足，先补齐主次级别K线后再分析。",
         )
 
-    # Build bi-level zhongshus for divergence detection (a+A+b+B+c structure)
-    bi_zhongshus = build_zhongshus_from_bis(snapshot.bis_main)
-
     divergence = detect_divergence_candidates(
         bis=snapshot.bis_main,
         zhongshu_count=market_state.zhongshu_count,
         trend_type=market_state.trend_type,
         macd=snapshot.macd_main,
         threshold=threshold,
-        zhongshus=bi_zhongshus,
+        zhongshus=snapshot.zhongshus_main,
+        allow_consolidation_fallback=cfg.allow_consolidation_divergence_fallback,
+        consolidation_anchor=next(
+            (
+                item
+                for item in snapshot.zhongshus_main
+                if item.start_index
+                == int(market_state.oscillation_state.get("anchor_start_index", -1))
+            ),
+            snapshot.last_zhongshu_main,
+        ),
     )
+    divergence = _sub_interval_confirmed(snapshot, divergence, threshold, cfg)
 
     macd_missing = len(snapshot.macd_main) == 0
     signals = generate_signals(
         divergence_candidates=divergence,
         bis_sub=snapshot.bis_sub,
         segments_sub=snapshot.segments_sub,
+        zhongshus_sub=snapshot.zhongshus_sub,
         zhongshu_main=snapshot.last_zhongshu_main,
         market_state=market_state,
         macd_missing=macd_missing,
@@ -270,6 +379,10 @@ def generate_signal(
     fresh_signals = _fresh_signals(snapshot, signals)
 
     conflict_level, conflict_note = _conflict_level(snapshot)
+    oscillation_note = _oscillation_note(market_state)
+    risk_note = (
+        f"{conflict_note}；{oscillation_note}" if oscillation_note else conflict_note
+    )
     action, summary = decide_action(
         fresh_signals, market_state, conflict_level, confidence_floor, cfg
     )
@@ -283,6 +396,6 @@ def generate_signal(
         market_state=market_state,
         signals=fresh_signals,
         action=action,
-        risk=build_risk(conflict_level, conflict_note),
+        risk=build_risk(conflict_level, risk_note),
         cn_summary=summary,
     )

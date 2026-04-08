@@ -22,23 +22,6 @@ def _has_three_overlap(b1: Bi, b2: Bi, b3: Bi) -> bool:
     return low <= high
 
 
-def _directional_start(b1: Bi, b2: Bi, b3: Bi) -> bool:
-    """Fallback for strong trends: if the three bis do NOT overlap but form
-    a clear directional sequence, allow them to start a segment.
-
-    In a strong uptrend successive down-bis may not retrace enough to
-    overlap, yet a segment clearly exists.  We accept the start when:
-    - b1 and b3 share the same direction, and
-    - that direction is consistent with the price movement (higher highs
-      for up, lower lows for down).
-    """
-    if b1.direction != b3.direction:
-        return False
-    if b1.direction == "up":
-        return b3.high > b1.high and b3.low > b1.low
-    return b3.low < b1.low and b3.high < b1.high
-
-
 def _merge_feature_bars(bars: list[FeatureBar]) -> list[FeatureBar]:
     if len(bars) < 2:
         return bars[:]
@@ -186,10 +169,7 @@ def build_segments(
 
     cursor = 0
     while cursor + 2 < len(bis):
-        if not (
-            _has_three_overlap(bis[cursor], bis[cursor + 1], bis[cursor + 2])
-            or _directional_start(bis[cursor], bis[cursor + 1], bis[cursor + 2])
-        ):
+        if not _has_three_overlap(bis[cursor], bis[cursor + 1], bis[cursor + 2]):
             cursor += 1
             continue
 
