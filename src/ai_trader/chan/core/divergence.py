@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ai_trader.chan.core.center import classify_center_relation
 from ai_trader.types import Bi, MACDPoint, TrendType, Zhongshu
 
 
 @dataclass(slots=True)
 class DivergenceCandidate:
-    signal_type: str
+    signal_type: str | None
     mode: str
     confidence: float
     trigger: str
@@ -169,8 +170,9 @@ def _find_trend_segments(
 ) -> tuple[list[Bi], list[Bi], list[Bi], list[Bi], Zhongshu, Zhongshu] | None:
     """Try to identify a+A+b+B+c structure.
 
-    For a downtrend direction="down":
-      - Need at least 2 zhongshus with zg(later) < zd(earlier) (down trend)
+    For a confirmed downtrend direction="down":
+      - Need at least 2 zhongshus whose wave ranges are fully separated
+        downward (later.gg < earlier.dd)
       - a = the connector window before A (first zhongshu)
       - c = the connector window after B (second/last zhongshu)
 
@@ -180,29 +182,19 @@ def _find_trend_segments(
     if len(zhongshus) < 2:
         return None
 
-    if direction == "down":
-        # Find last pair of zhongshus forming downtrend (later.zg < earlier.zd)
-        for j in range(len(zhongshus) - 1, 0, -1):
-            B = zhongshus[j]
-            A = zhongshus[j - 1]
-            if B.zg < A.zd:
-                a_window = _trend_leg_before_center(bis, zhongshus, j - 1, direction)
-                c_window = _trend_leg_after_center(bis, zhongshus, j)
-                a_dir = [bi for bi in a_window if bi.direction == direction]
-                c_dir = [bi for bi in c_window if bi.direction == direction]
-                if a_dir and c_dir:
-                    return a_window, c_window, a_dir, c_dir, A, B
-    else:
-        for j in range(len(zhongshus) - 1, 0, -1):
-            B = zhongshus[j]
-            A = zhongshus[j - 1]
-            if B.zd > A.zg:
-                a_window = _trend_leg_before_center(bis, zhongshus, j - 1, direction)
-                c_window = _trend_leg_after_center(bis, zhongshus, j)
-                a_dir = [bi for bi in a_window if bi.direction == direction]
-                c_dir = [bi for bi in c_window if bi.direction == direction]
-                if a_dir and c_dir:
-                    return a_window, c_window, a_dir, c_dir, A, B
+    expected_relation = "trend_down" if direction == "down" else "trend_up"
+    for j in range(len(zhongshus) - 1, 0, -1):
+        B = zhongshus[j]
+        A = zhongshus[j - 1]
+        if classify_center_relation(A, B) != expected_relation:
+            continue
+
+        a_window = _trend_leg_before_center(bis, zhongshus, j - 1, direction)
+        c_window = _trend_leg_after_center(bis, zhongshus, j)
+        a_dir = [bi for bi in a_window if bi.direction == direction]
+        c_dir = [bi for bi in c_window if bi.direction == direction]
+        if a_dir and c_dir:
+            return a_window, c_window, a_dir, c_dir, A, B
 
     return None
 
@@ -261,20 +253,22 @@ def _build_candidate(
     anchor_center: Zhongshu,
 ) -> DivergenceCandidate:
     if direction == "down":
-        signal_type = "B1"
         if mode == "trend":
+            signal_type = "B1"
             trigger = "主级别向下走势创新低但MACD柱子面积衰减（背驰候选）"
             invalid_if = f"价格继续跌破{cur_bi.end_price:.2f}并延续下行"
         else:
-            trigger = "单中枢震荡中向下离开后再创新低但力度衰减（盘整背驰候选）"
+            signal_type = None
+            trigger = "单中枢震荡中向下离开后再创新低但力度衰减（盘整背驰提示）"
             invalid_if = f"价格继续跌破{cur_bi.end_price:.2f}并延续离开中枢"
     else:
-        signal_type = "S1"
         if mode == "trend":
+            signal_type = "S1"
             trigger = "主级别向上走势创新高但MACD柱子面积衰减（背驰候选）"
             invalid_if = f"价格继续突破{cur_bi.end_price:.2f}并延续上行"
         else:
-            trigger = "单中枢震荡中向上离开后再创新高但力度衰减（盘整背驰候选）"
+            signal_type = None
+            trigger = "单中枢震荡中向上离开后再创新高但力度衰减（盘整背驰提示）"
             invalid_if = f"价格继续突破{cur_bi.end_price:.2f}并延续离开中枢"
 
     base = 0.60 if mode == "trend" else 0.50
@@ -303,7 +297,7 @@ def detect_divergence_candidates(
     macd: list[MACDPoint],
     threshold: float,
     zhongshus: list[Zhongshu] | None = None,
-    allow_consolidation_fallback: bool = True,
+    include_consolidation_divergence_hint: bool = True,
     consolidation_anchor: Zhongshu | None = None,
 ) -> list[DivergenceCandidate]:
     """Detect trend divergence and consolidation divergence.
@@ -314,9 +308,9 @@ def detect_divergence_candidates(
        compares the MACD area of a-segment vs c-segment.
     3. Requires DIF/DEA zero-axis pullback between segments as precondition
        for trend divergence.
-    4. Falls back to restricted single-center oscillation divergence:
-       two same-direction departures from one center with a re-entry
-       to the center in between.
+    4. Optionally records restricted single-center oscillation divergence
+       as a non-executable hint: two same-direction departures from one
+       center with a re-entry to the center in between.
     """
     out: list[DivergenceCandidate] = []
     if zhongshus is None:
@@ -373,7 +367,7 @@ def detect_divergence_candidates(
                                 )
                                 continue  # found trend divergence, skip fallback
 
-        if not allow_consolidation_fallback:
+        if not include_consolidation_divergence_hint:
             continue
 
         # ----- Restricted single-center consolidation divergence -----

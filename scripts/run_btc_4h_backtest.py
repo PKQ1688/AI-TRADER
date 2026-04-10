@@ -30,6 +30,7 @@ def main() -> None:
         drawdown_reduce_threshold=0.12,
         drawdown_freeze_threshold=0.18,
         freeze_recovery_days=21,
+        chan_mode="orthodox_chan",
     )
 
     bars_main = load_ohlcv(config.exchange, config.symbol, config.timeframe_main, config.start_utc, config.end_utc)

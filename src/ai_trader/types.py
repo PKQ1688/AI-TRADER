@@ -381,9 +381,10 @@ class BacktestConfig:
     symbol: str = "BTC/USDT"
     timeframe_main: str = "4h"
     timeframe_sub: str = "1h"
-    chan_mode: Literal["strict_kline8", "orthodox_chan", "pragmatic"] = "strict_kline8"
+    chan_mode: Literal["strict_kline8", "orthodox_chan", "pragmatic"] = "orthodox_chan"
     start_utc: str = "2022-02-10T00:00:00Z"
     end_utc: str = "2026-02-10T00:00:00Z"
+    history_prefetch_days: int = 365
     initial_capital: float = 100000.0
     fee_rate: float = 0.001
     slippage_rate: float = 0.0002

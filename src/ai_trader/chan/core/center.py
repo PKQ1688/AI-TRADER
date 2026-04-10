@@ -1,8 +1,16 @@
 from __future__ import annotations
 
-from typing import cast
+from typing import Literal, cast
 
 from ai_trader.types import Bi, Segment, Zhongshu, ZhongshuEvolution
+
+CenterRelation = Literal[
+    "extension",
+    "trend_up",
+    "trend_down",
+    "expansion",
+    "separate",
+]
 
 
 def _build_center_from_three_segments(
@@ -74,27 +82,25 @@ def _wave_ranges_touch(prev: Zhongshu, cur: Zhongshu) -> bool:
     return max(prev.dd, cur.dd) <= min(prev.gg, cur.gg)
 
 
-def _merge_two_centers(prev: Zhongshu, cur: Zhongshu) -> Zhongshu:
-    """Merge two centers into a larger-level center (level expansion).
+def classify_center_relation(prev: Zhongshu, cur: Zhongshu) -> CenterRelation:
+    """Classify the relation between two consecutive same-level centers.
 
-    The merged center's zd/zg is the intersection of the combined
-    oscillation ranges, and gg/dd spans everything.
+    Chan 中枢定理里，趋势延续和级别扩展不能只看 [ZD, ZG] 是否分离，
+    还必须结合波动区间 [DD, GG]。
     """
-    return Zhongshu(
-        zd=min(prev.zd, cur.zd),
-        zg=max(prev.zg, cur.zg),
-        gg=max(prev.gg, cur.gg),
-        dd=min(prev.dd, cur.dd),
-        g=min(prev.g, cur.g),
-        d=max(prev.d, cur.d),
-        start_index=prev.start_index,
-        end_index=cur.end_index,
-        event_time=cur.event_time,
-        available_time=max(prev.available_time, cur.available_time),
-        origin_available_time=prev.origin_available_time,
-        evolution="expansion",
-        status="confirmed",
-    )
+    if _overlap_center(prev, cur):
+        return "extension"
+    if cur.dd > prev.gg:
+        return "trend_up"
+    if cur.gg < prev.dd:
+        return "trend_down"
+    if cur.zd > prev.zg and cur.dd <= prev.gg:
+        return "expansion"
+    if cur.zg < prev.zd and cur.gg >= prev.dd:
+        return "expansion"
+    if _wave_ranges_touch(prev, cur):
+        return "expansion"
+    return "separate"
 
 
 def _evolve_and_append(out: list[Zhongshu], candidate: Zhongshu) -> None:
@@ -106,9 +112,10 @@ def _evolve_and_append(out: list[Zhongshu], candidate: Zhongshu) -> None:
         return
 
     prev = out[-1]
+    relation = classify_center_relation(prev, candidate)
 
     # Case 1: 中枢区间 overlap → extension (same center continues)
-    if _overlap_center(prev, candidate):
+    if relation == "extension":
         prev.zd = max(prev.zd, candidate.zd)
         prev.zg = min(prev.zg, candidate.zg)
         prev.gg = max(prev.gg, candidate.gg)
@@ -121,19 +128,21 @@ def _evolve_and_append(out: list[Zhongshu], candidate: Zhongshu) -> None:
         prev.evolution = "extension"
         return
 
-    # Case 2: 中枢区间 no overlap but wave ranges touch → expansion.
+    # Case 2: 级别扩张。保留当前级别的中心序列，不把它们塌缩成一个
+    # 人造的大中枢，否则后续趋势和三类买卖点判断会失真。
     #
     # Preserve the current-level center sequence instead of collapsing it
     # into a synthetic larger center.  Kline8-20 treats this as 级别扩张,
     # which means the previous and current centers imply a higher-level
     # structure, but they should not erase the current-level history that
     # later B3 / trend checks rely on.
-    if _wave_ranges_touch(prev, candidate):
+    if relation == "expansion":
         candidate.evolution = cast(ZhongshuEvolution, "expansion")
         out.append(candidate)
         return
 
-    # Case 3: completely separate → newborn
+    # Case 3: completely separate or confirmed same-direction trend →
+    # append a new same-level center.
     candidate.evolution = cast(ZhongshuEvolution, "newborn")
     out.append(candidate)
 
@@ -182,12 +191,11 @@ def build_zhongshus_from_bis(bis: list[Bi]) -> list[Zhongshu]:
             i += 1
             continue
 
-        # Try to extend with subsequent bis (center extension up to 9 bis
-        # per kline8-33: "中枢的延伸不能超过5段" → 3 initial + 6 extension = 9 max)
+        # Keep extending while the next bi overlaps the current center.
+        # Zn 超过 9 的监视规则属于震荡监控层，不应在中枢生成层截断
+        # 正在延伸的中枢。
         j = i + 3
-        extension_count = 0
-        max_extensions = 6  # 5 extra segments beyond the initial 3
-        while j < len(bis) and extension_count < max_extensions:
+        while j < len(bis):
             bi = bis[j]
             if bi.low <= candidate.zg and bi.high >= candidate.zd:
                 # This bi overlaps the center → extend
@@ -202,7 +210,6 @@ def build_zhongshus_from_bis(bis: list[Bi]) -> list[Zhongshu]:
                 candidate.available_time = max(
                     candidate.available_time, bi.available_time
                 )
-                extension_count += 1
                 j += 1
             else:
                 break

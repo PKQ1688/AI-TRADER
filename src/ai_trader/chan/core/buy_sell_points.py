@@ -19,6 +19,18 @@ def _apply_phase_cap(signal_type: str, confidence: float, phase: str, cap: float
     return min(confidence, cap)
 
 
+def allow_high_conflict_reversal(signal: Signal | None, market_state: MarketState) -> bool:
+    if signal is None:
+        return False
+    if signal.type in {"B3", "S3"}:
+        return True
+    if signal.type in {"B1", "B2"} and market_state.trend_type == "down":
+        return True
+    if signal.type in {"S1", "S2"} and market_state.trend_type == "up":
+        return True
+    return False
+
+
 def _confirmed_bis_in_b2_window(
     bis_sub: list[Bi],
     anchor_time,
@@ -59,19 +71,19 @@ def _first_pullback_after_departure(
     segments_sub: list[Segment],
     zhongshu: Zhongshu,
     departure_direction: str,
-) -> Segment | None:
+) -> tuple[Segment, Segment] | None:
     center_confirmed_at = zhongshu.origin_available_time or zhongshu.available_time
     confirmed = [
         item
         for item in _confirmed_segments(segments_sub)
         if item.available_time >= center_confirmed_at
     ]
-    if len(confirmed) < 2:
+    if len(confirmed) < 3:
         return None
 
     pullback_direction = "down" if departure_direction == "up" else "up"
 
-    for pullback_idx in range(1, len(confirmed)):
+    for pullback_idx in range(1, len(confirmed) - 1):
         pullback = confirmed[pullback_idx]
         if pullback.direction != pullback_direction:
             continue
@@ -79,6 +91,8 @@ def _first_pullback_after_departure(
         departure_end_idx = pullback_idx - 1
         departure_end = confirmed[departure_end_idx]
         if departure_end.direction != departure_direction:
+            continue
+        if departure_end.start_index < zhongshu.end_index:
             continue
 
         if departure_direction == "up" and departure_end.high <= zhongshu.zg:
@@ -99,7 +113,57 @@ def _first_pullback_after_departure(
         ):
             continue
 
-        return pullback
+        confirm = confirmed[pullback_idx + 1]
+        if confirm.direction != departure_direction:
+            continue
+
+        return pullback, confirm
+
+    return None
+
+
+def _first_bi_pullback_after_departure(
+    bis_context: list[Bi],
+    zhongshu: Zhongshu,
+    departure_direction: str,
+) -> tuple[Bi, Bi] | None:
+    center_confirmed_at = zhongshu.origin_available_time or zhongshu.available_time
+    confirmed = [
+        item
+        for item in bis_context
+        if item.status == "confirmed" and item.available_time >= center_confirmed_at
+    ]
+    if len(confirmed) < 3:
+        return None
+
+    pullback_direction = "down" if departure_direction == "up" else "up"
+    saw_departure = False
+    pullback = None
+
+    for item in confirmed:
+        if not saw_departure:
+            if item.start_index < zhongshu.end_index:
+                continue
+            if item.direction != departure_direction:
+                continue
+            if departure_direction == "up" and item.high <= zhongshu.zg:
+                continue
+            if departure_direction == "down" and item.low >= zhongshu.zd:
+                continue
+            saw_departure = True
+            continue
+
+        if pullback is None:
+            if item.direction == departure_direction:
+                continue
+            if item.direction != pullback_direction:
+                continue
+            pullback = item
+            continue
+
+        if item.direction != departure_direction:
+            continue
+        return pullback, item
 
     return None
 
@@ -204,22 +268,52 @@ def _derive_s2(
     )
 
 
-def _derive_b3(segments_sub: list[Segment], zhongshu: Zhongshu | None) -> Signal | None:
+def _derive_b3(
+    segments_sub: list[Segment],
+    zhongshu: Zhongshu | None,
+    bis_context: list[Bi] | None = None,
+) -> Signal | None:
     if zhongshu is None:
         return None
 
-    pullback = _first_pullback_after_departure(
+    center_confirmed_at = zhongshu.origin_available_time or zhongshu.available_time
+
+    if bis_context:
+        sequence = _first_bi_pullback_after_departure(
+            bis_context=bis_context,
+            zhongshu=zhongshu,
+            departure_direction="up",
+        )
+        if sequence is not None:
+            pullback_bi, confirm_bi = sequence
+            if pullback_bi.low > zhongshu.zg:
+                available_time = max(confirm_bi.available_time, center_confirmed_at)
+                return Signal(
+                    type="B3",
+                    level="main",
+                    trigger="次级别向上离开中枢后，首次回抽未重新进入中枢",
+                    invalid_if=f"价格跌回中枢上沿{zhongshu.zg:.2f}下方",
+                    confidence=0.68,
+                    event_time=pullback_bi.event_time,
+                    available_time=available_time,
+                    invalid_price=zhongshu.zg,
+                    anchor_center_start_index=zhongshu.start_index,
+                    anchor_center_end_index=zhongshu.end_index,
+                    anchor_center_available_time=center_confirmed_at,
+                )
+
+    sequence = _first_pullback_after_departure(
         segments_sub=segments_sub,
         zhongshu=zhongshu,
         departure_direction="up",
     )
-    if pullback is None:
+    if sequence is None:
         return None
+    pullback, confirm = sequence
     if pullback.low <= zhongshu.zg:
         return None
 
-    center_confirmed_at = zhongshu.origin_available_time or zhongshu.available_time
-    available_time = max(pullback.available_time, center_confirmed_at)
+    available_time = max(confirm.available_time, center_confirmed_at)
     return Signal(
         type="B3",
         level="main",
@@ -235,22 +329,52 @@ def _derive_b3(segments_sub: list[Segment], zhongshu: Zhongshu | None) -> Signal
     )
 
 
-def _derive_s3(segments_sub: list[Segment], zhongshu: Zhongshu | None) -> Signal | None:
+def _derive_s3(
+    segments_sub: list[Segment],
+    zhongshu: Zhongshu | None,
+    bis_context: list[Bi] | None = None,
+) -> Signal | None:
     if zhongshu is None:
         return None
 
-    pullback = _first_pullback_after_departure(
+    center_confirmed_at = zhongshu.origin_available_time or zhongshu.available_time
+
+    if bis_context:
+        sequence = _first_bi_pullback_after_departure(
+            bis_context=bis_context,
+            zhongshu=zhongshu,
+            departure_direction="down",
+        )
+        if sequence is not None:
+            pullback_bi, confirm_bi = sequence
+            if pullback_bi.high < zhongshu.zd:
+                available_time = max(confirm_bi.available_time, center_confirmed_at)
+                return Signal(
+                    type="S3",
+                    level="main",
+                    trigger="次级别向下离开中枢后，首次反抽未重新进入中枢",
+                    invalid_if=f"价格重新站回中枢下沿{zhongshu.zd:.2f}上方",
+                    confidence=0.68,
+                    event_time=pullback_bi.event_time,
+                    available_time=available_time,
+                    invalid_price=zhongshu.zd,
+                    anchor_center_start_index=zhongshu.start_index,
+                    anchor_center_end_index=zhongshu.end_index,
+                    anchor_center_available_time=center_confirmed_at,
+                )
+
+    sequence = _first_pullback_after_departure(
         segments_sub=segments_sub,
         zhongshu=zhongshu,
         departure_direction="down",
     )
-    if pullback is None:
+    if sequence is None:
         return None
+    pullback, confirm = sequence
     if pullback.high >= zhongshu.zd:
         return None
 
-    center_confirmed_at = zhongshu.origin_available_time or zhongshu.available_time
-    available_time = max(pullback.available_time, center_confirmed_at)
+    available_time = max(confirm.available_time, center_confirmed_at)
     return Signal(
         type="S3",
         level="main",
@@ -276,14 +400,17 @@ def generate_signals(
     missing_macd_penalty: float,
     transitional_confidence_cap: float,
     zhongshus_sub: list[Zhongshu] | None = None,
+    bis_context: list[Bi] | None = None,
 ) -> list[Signal]:
     zhongshus_sub = zhongshus_sub or []
     signals: list[Signal] = []
 
     for item in divergence_candidates:
+        if item.signal_type is None:
+            continue
         signals.append(
             Signal(
-                type=item.signal_type,  # type: ignore[arg-type]
+                type=item.signal_type,
                 level="main",
                 trigger=item.trigger,
                 invalid_if=item.invalid_if,
@@ -309,11 +436,11 @@ def generate_signals(
         if s2 is not None:
             signals.append(s2)
 
-    b3 = _derive_b3(segments_sub, zhongshu_main)
+    b3 = _derive_b3(segments_sub, zhongshu_main, bis_context=bis_context)
     if b3 is not None:
         signals.append(b3)
 
-    s3 = _derive_s3(segments_sub, zhongshu_main)
+    s3 = _derive_s3(segments_sub, zhongshu_main, bis_context=bis_context)
     if s3 is not None:
         signals.append(s3)
 
@@ -334,6 +461,17 @@ def _best_signal(signals: Iterable[Signal], kinds: set[str], min_confidence: flo
         return None
     candidates.sort(key=lambda x: x.confidence, reverse=True)
     return candidates[0]
+
+
+def _preferred_signal(
+    signals: Iterable[Signal], ordered_kinds: tuple[str, ...], min_confidence: float
+) -> Signal | None:
+    pool = list(signals)
+    for kind in ordered_kinds:
+        candidate = _best_signal(pool, {kind}, min_confidence)
+        if candidate is not None:
+            return candidate
+    return None
 
 
 def decide_action(
@@ -361,8 +499,37 @@ def decide_action(
     first_breakout = bool(oscillation.get("first_breakout", False))
     limit_reached = bool(oscillation.get("limit_reached", False))
 
+    if getattr(chan_config, "prefer_first_class_signals", False):
+        preferred_buy = _preferred_signal(signals, ("B1", "B2", "B3"), buy_conf)
+        preferred_reduce = _preferred_signal(signals, ("S1", "S2", "S3"), reduce_conf)
+        preferred_sell = _preferred_signal(signals, ("S1", "S2", "S3"), reduce_conf)
+        if preferred_buy is not None and preferred_buy.type in buy_types:
+            best_buy = preferred_buy
+        if preferred_reduce is not None and preferred_reduce.type in reduce_types:
+            best_reduce = preferred_reduce
+        if preferred_sell is not None and preferred_sell.type in sell_types:
+            best_sell = preferred_sell
+
+    allow_high_conflict_buy = allow_high_conflict_reversal(best_buy, market_state)
+    allow_high_conflict_sell = allow_high_conflict_reversal(best_sell, market_state)
+    transitional_reversal_buy = (
+        best_buy is not None
+        and best_buy.type in {"B1", "B2"}
+        and market_state.trend_type == "down"
+    )
+    transitional_reversal_sell = (
+        best_sell is not None
+        and best_sell.type in {"S1", "S2"}
+        and market_state.trend_type == "up"
+    )
+
     if market_state.phase == "transitional":
-        if best_b3 is None and best_s3 is None:
+        if (
+            best_b3 is None
+            and best_s3 is None
+            and not transitional_reversal_buy
+            and not transitional_reversal_sell
+        ):
             if oscillation_breakout in {"above_zg", "below_zd"} and first_breakout:
                 return (
                     Action(decision="wait", reason="中阴阶段内Zn首次越界，先区分三买卖与中枢扩展"),
@@ -375,19 +542,27 @@ def decide_action(
                 )
             return Action(decision="wait", reason="中阴阶段默认等待新走势类型确认"), "处于中阴阶段，等待第三类买卖点确认后再操作。"
 
-    if conflict_level == "high":
+    if conflict_level == "high" and not allow_high_conflict_buy and not allow_high_conflict_sell:
         if best_reduce is not None:
             return Action(decision="reduce", reason="主次级别冲突高，卖点仅用于降风险"), "主次级别冲突高，优先减仓而非激进反手。"
         return Action(decision="wait", reason="主次级别冲突高，放弃方向性动作"), "主次级别冲突高，等待结构统一后再执行。"
 
     if (
         best_buy is not None
-        and (not chan_config.require_non_high_conflict_buy or conflict_level != "high")
+        and (
+            not chan_config.require_non_high_conflict_buy
+            or conflict_level != "high"
+            or allow_high_conflict_buy
+        )
         and (best_reduce is None or best_buy.confidence >= best_reduce.confidence)
     ):
+        if best_buy.type == "B1":
+            return Action(decision="buy", reason="出现第一类买点（B1）"), "当前出现一类买点，可按结构与风控执行。"
         return Action(decision="buy", reason="出现保守确认买点（B2/B3）"), "当前出现保守确认买点，可按风控分批参与。"
 
     if best_sell is not None:
+        if best_sell.type == "S1":
+            return Action(decision="sell", reason="出现第一类卖点（S1）"), "当前出现一类卖点，优先按结构退出或反手。"
         return Action(decision="sell", reason="执行过滤后出现强卖出条件"), "出现强卖出条件，优先平仓控制风险。"
 
     if best_reduce is not None:

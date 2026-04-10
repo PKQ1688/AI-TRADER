@@ -8,7 +8,7 @@ Mode = Literal["strict_kline8", "orthodox_chan", "pragmatic"]
 
 @dataclass(slots=True)
 class ChanConfig:
-    mode: Mode = "strict_kline8"
+    mode: Mode = "orthodox_chan"
     min_main_bars: int = 50
     min_sub_bars: int = 100
     min_stroke_bars: int = 5
@@ -25,23 +25,25 @@ class ChanConfig:
     execution_reduce_min_confidence: float = 0.65
     require_non_high_conflict_buy: bool = True
     reduce_only_on_high_conflict: bool = True
+    prefer_first_class_signals: bool = False
     require_sub_interval_confirmation: bool = True
-    allow_consolidation_divergence_fallback: bool = False
+    include_consolidation_divergence_hint: bool = False
 
 
 STRICT_KLINE8 = ChanConfig(
-    allow_consolidation_divergence_fallback=True,
+    require_sub_interval_confirmation=False,
 )
 ORTHODOX_CHAN = ChanConfig(
     mode="orthodox_chan",
-    execution_buy_types=("B2", "B3"),
+    execution_buy_types=("B1", "B2", "B3"),
     execution_reduce_types=("S1", "S2", "S3"),
-    execution_sell_types=("S2", "S3"),
-    execution_buy_min_confidence=0.65,
+    execution_sell_types=("S1", "S2", "S3"),
+    execution_buy_min_confidence=0.60,
     execution_reduce_min_confidence=0.60,
-    reduce_only_on_high_conflict=True,
+    reduce_only_on_high_conflict=False,
+    prefer_first_class_signals=True,
     require_sub_interval_confirmation=False,
-    allow_consolidation_divergence_fallback=True,
+    include_consolidation_divergence_hint=False,
 )
 PRAGMATIC = ChanConfig(
     mode="pragmatic",
@@ -60,11 +62,11 @@ PRAGMATIC = ChanConfig(
     require_non_high_conflict_buy=False,
     reduce_only_on_high_conflict=False,
     require_sub_interval_confirmation=False,
-    allow_consolidation_divergence_fallback=True,
+    include_consolidation_divergence_hint=True,
 )
 
 
-def get_chan_config(mode: Mode = "strict_kline8") -> ChanConfig:
+def get_chan_config(mode: Mode = "orthodox_chan") -> ChanConfig:
     if mode == "strict_kline8":
         return STRICT_KLINE8
     if mode == "orthodox_chan":

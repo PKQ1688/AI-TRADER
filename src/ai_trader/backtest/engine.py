@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import random
+from datetime import timedelta
 from dataclasses import replace
 from statistics import mean
 
 from ai_trader.chan.config import get_chan_config
+from ai_trader.chan.core.buy_sell_points import allow_high_conflict_reversal
 from ai_trader.chan import build_chan_state, generate_signal
+from ai_trader.chan.engine import suppress_seen_signal_events
 from ai_trader.backtest.metrics import calc_metrics, calc_segmented_metrics, calc_walk_forward_metrics
 from ai_trader.backtest.significance import evaluate_significance
 from ai_trader.data.binance_ohlcv import load_ohlcv
@@ -18,6 +21,7 @@ from ai_trader.types import (
     Signal,
     Trade,
     iso_utc,
+    parse_utc_time,
 )
 
 
@@ -52,12 +56,22 @@ def _pick_benchmark_return(rng: random.Random, year_returns: dict[int, list[floa
     return candidates[rng.randrange(0, len(candidates))]
 
 
-def _top_signal(signals: list[Signal], signal_types: set[str], min_confidence: float) -> Signal | None:
+def _top_signal(
+    signals: list[Signal],
+    signal_types: set[str],
+    min_confidence: float,
+    preferred_types: tuple[str, ...] = (),
+) -> Signal | None:
     if not signal_types:
         return None
     candidates = [item for item in signals if item.type in signal_types and item.confidence >= min_confidence]
     if not candidates:
         return None
+    for preferred in preferred_types:
+        typed = [item for item in candidates if item.type == preferred]
+        if typed:
+            typed.sort(key=lambda item: item.confidence, reverse=True)
+            return typed[0]
     candidates.sort(key=lambda item: item.confidence, reverse=True)
     return candidates[0]
 
@@ -78,13 +92,23 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
     sell_entry_types = set(chan_config.execution_sell_types)
     buy_entry_min_conf = max(config.min_confidence, chan_config.execution_buy_min_confidence)
     sell_entry_min_conf = max(config.min_confidence, chan_config.execution_reduce_min_confidence)
+    buy_signal_priority = ("B1", "B2", "B3") if chan_config.prefer_first_class_signals else ()
+    sell_signal_priority = ("S1", "S2", "S3") if chan_config.prefer_first_class_signals else ()
+
+    evaluation_start = None
+    load_start_utc = config.start_utc
+    if bars_main is None or bars_sub is None:
+        evaluation_start = parse_utc_time(config.start_utc)
+        load_start_utc = iso_utc(
+            evaluation_start - timedelta(days=config.history_prefetch_days)
+        )
 
     if bars_main is None:
         bars_main = load_ohlcv(
             exchange=config.exchange,
             symbol=config.symbol,
             timeframe=config.timeframe_main,
-            start_utc=config.start_utc,
+            start_utc=load_start_utc,
             end_utc=config.end_utc,
         )
     if bars_sub is None:
@@ -92,7 +116,7 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
             exchange=config.exchange,
             symbol=config.symbol,
             timeframe=config.timeframe_sub,
-            start_utc=config.start_utc,
+            start_utc=load_start_utc,
             end_utc=config.end_utc,
         )
 
@@ -129,6 +153,8 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
     last_reduce_signature: tuple | None = None
     consumed_buy_center_keys: set[tuple[str, int]] = set()
     consumed_sell_center_keys: set[tuple[str, int]] = set()
+    seen_signal_keys: set[tuple] = set()
+    turning_signal_guards: dict[tuple, dict[str, object]] = {}
 
     frozen = False
     freeze_start = None
@@ -148,8 +174,33 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
     year_returns = _forward_returns_by_year(bars_main)
 
     sub_cursor = 0
+    start_index = 120
+    if evaluation_start is not None:
+        start_index = max(
+            120,
+            next(
+                (i for i, item in enumerate(bars_main) if item.time >= evaluation_start),
+                len(bars_main),
+            ),
+        )
 
-    for i in range(120, len(bars_main) - 1):
+    if start_index >= len(bars_main) - 1:
+        empty_sig = evaluate_significance([])
+        return BacktestReport(
+            config=config,
+            metrics={"total_return": 0.0, "max_drawdown": 0.0, "trade_count": 0.0, "expectancy": 0.0},
+            segmented_metrics={},
+            walk_forward_metrics={},
+            significance=empty_sig,
+            pass_checks={"data_ready": False},
+            fail_reasons=["评估区间不足，无法完成回测"],
+            signal_repaint_rate=0.0,
+            trades=[],
+            signals=[],
+            equity_curve=[],
+        )
+
+    for i in range(start_index, len(bars_main) - 1):
         bar = bars_main[i]
         next_bar = bars_main[i + 1]
 
@@ -187,11 +238,21 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
             timeframe_sub=config.timeframe_sub,
             chan_config=chan_config,
         )
-        decision = generate_signal(
+        raw_decision = generate_signal(
             snapshot=snapshot,
             macd_divergence_threshold=config.macd_divergence_threshold,
             min_confidence=config.min_confidence,
             chan_config=chan_config,
+        )
+        raw_decision_dict = raw_decision.to_contract_dict()
+        decision = suppress_seen_signal_events(
+            decision=raw_decision,
+            seen_signal_keys=seen_signal_keys,
+            chan_config=chan_config,
+            min_confidence=config.min_confidence,
+            active_turning_guards=turning_signal_guards,
+            asof_low=bar.low,
+            asof_high=bar.high,
         )
         decision_dict = decision.to_contract_dict()
         decision_dict["time"] = iso_utc(bar.time)
@@ -206,7 +267,7 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
 
         now_key = iso_utc(bar.time)
         decision_signature = _decision_signature(decision_dict)
-        signal_signatures[now_key] = decision_signature
+        signal_signatures[now_key] = _decision_signature(raw_decision_dict)
 
         if i > 120:
             prev_time = bars_main[i - 1].time
@@ -236,7 +297,10 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
 
         # 冻结恢复双通道
         if frozen:
-            has_effective_buy = any(item.type in {"B2", "B3"} and item.confidence >= config.min_confidence for item in decision.signals)
+            has_effective_buy = any(
+                item.type in buy_entry_types and item.confidence >= config.min_confidence
+                for item in decision.signals
+            )
             newer_zhongshu = (
                 snapshot.last_zhongshu_main is not None
                 and (
@@ -264,13 +328,24 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
         if recovery_positive_needed > 0:
             size_multiplier = min(size_multiplier, 0.5)
 
-        buy_signal = _top_signal(decision.signals, buy_entry_types, buy_entry_min_conf)
+        buy_signal = _top_signal(
+            decision.signals,
+            buy_entry_types,
+            buy_entry_min_conf,
+            preferred_types=buy_signal_priority,
+        )
         reduce_signal = _top_signal(
             decision.signals,
             set(chan_config.execution_reduce_types),
             max(config.min_confidence, chan_config.execution_reduce_min_confidence),
+            preferred_types=sell_signal_priority,
         )
-        sell_signal = _top_signal(decision.signals, sell_entry_types, sell_entry_min_conf)
+        sell_signal = _top_signal(
+            decision.signals,
+            sell_entry_types,
+            sell_entry_min_conf,
+            preferred_types=sell_signal_priority,
+        )
         buy_center_key = _signal_center_key(buy_signal, snapshot)
         sell_center_key = _signal_center_key(sell_signal, snapshot)
 
@@ -383,7 +458,10 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
             and decision.action.decision == "buy"
             and buy_signal is not None
             and (buy_center_key is None or buy_center_key not in consumed_buy_center_keys)
-            and decision.risk.conflict_level != "high"
+            and (
+                decision.risk.conflict_level != "high"
+                or allow_high_conflict_reversal(buy_signal, decision.market_state)
+            )
             and decision.data_quality.status == "ok"
         )
         can_open_short = (
@@ -393,7 +471,10 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
             and decision.action.decision == "sell"
             and sell_signal is not None
             and (sell_center_key is None or sell_center_key not in consumed_sell_center_keys)
-            and decision.risk.conflict_level != "high"
+            and (
+                decision.risk.conflict_level != "high"
+                or allow_high_conflict_reversal(sell_signal, decision.market_state)
+            )
             and decision.data_quality.status == "ok"
         )
 
@@ -452,15 +533,17 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
     segmented_metrics = calc_segmented_metrics(equity_curve=equity_curve, trades=trades, initial_capital=config.initial_capital)
     walk_forward_metrics = calc_walk_forward_metrics(equity_curve=equity_curve, trades=trades, initial_capital=config.initial_capital)
 
+    buy_label = "/".join(sorted(buy_entry_types)) if buy_entry_types else "buy"
+
     sample_count = sum(
         1
         for record in decisions_out
         for item in record["signals"]
-        if item["type"] in {"B2", "B3"} and float(item["confidence"]) >= config.min_confidence
+        if item["type"] in buy_entry_types and float(item["confidence"]) >= config.min_confidence
     )
 
-    b23_forward = [item.forward_3bar_return for item in trades if item.signal_type in {"B2", "B3"}]
-    b23_expectation = mean(b23_forward) if b23_forward else 0.0
+    buy_forward = [item.forward_3bar_return for item in trades if item.signal_type in buy_entry_types]
+    b23_expectation = mean(buy_forward) if buy_forward else 0.0
 
     signal_repaint_rate = repaint_count / repaint_checks if repaint_checks > 0 else 0.0
 
@@ -475,8 +558,8 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
     fail_reasons = [
         reason
         for key, reason in {
-            "sample_count_ge_80": "有效B2/B3样本不足80",
-            "b23_expectation_gt_0": "B2/B3三根4h前瞻收益期望未大于0",
+            "sample_count_ge_80": f"有效{buy_label}样本不足80",
+            "b23_expectation_gt_0": f"{buy_label}三根4h前瞻收益期望未大于0",
             "p_value_lt_0_05": "相对时间匹配随机基线未达到统计显著(p>=0.05)",
             "max_drawdown_le_0_25": "最大回撤超过25%",
             "signal_repaint_rate_eq_0": "检测到信号重绘",

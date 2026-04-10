@@ -1,0 +1,379 @@
+[
+  {
+    "id": "lesson18_center_from_three_overlap",
+    "lesson": 18,
+    "source_url": "https://kline8.com/chanlun?p=18",
+    "rule": "走势中枢由至少三个连续次级别走势类型重叠部分构成。",
+    "runner": "build_zhongshus_from_bis",
+    "input": {
+      "bis": [
+        {
+          "idx": 0,
+          "direction": "up",
+          "start": 100.0,
+          "end": 110.0
+        },
+        {
+          "idx": 1,
+          "direction": "down",
+          "start": 108.0,
+          "end": 95.0
+        },
+        {
+          "idx": 2,
+          "direction": "up",
+          "start": 96.0,
+          "end": 105.0
+        }
+      ]
+    },
+    "expected": {
+      "count": 1,
+      "first": {
+        "zd": 100.0,
+        "zg": 105.0,
+        "start_index": 0,
+        "end_index": 3
+      }
+    }
+  },
+  {
+    "id": "lesson20_absolute_non_overlap_is_trend_up",
+    "lesson": 20,
+    "source_url": "https://kline8.com/chanlun?p=20",
+    "rule": "后中枢波动区间整体高于前中枢波动区间时，构成上涨趋势而非扩张。",
+    "runner": "classify_center_relation",
+    "input": {
+      "prev": {
+        "zd": 95.0,
+        "zg": 100.0,
+        "gg": 105.0,
+        "dd": 90.0,
+        "start_index": 0,
+        "end_index": 3
+      },
+      "cur": {
+        "zd": 110.0,
+        "zg": 115.0,
+        "gg": 120.0,
+        "dd": 106.0,
+        "start_index": 4,
+        "end_index": 7
+      }
+    },
+    "expected": {
+      "relation": "trend_up"
+    }
+  },
+  {
+    "id": "lesson20_wave_touch_is_expansion_not_trend",
+    "lesson": 20,
+    "source_url": "https://kline8.com/chanlun?p=20",
+    "rule": "中枢区间虽不重叠，但波动区间相触时属于级别扩张，不是趋势。",
+    "runner": "classify_center_relation",
+    "input": {
+      "prev": {
+        "zd": 95.0,
+        "zg": 100.0,
+        "gg": 105.0,
+        "dd": 90.0,
+        "start_index": 0,
+        "end_index": 3
+      },
+      "cur": {
+        "zd": 102.0,
+        "zg": 108.0,
+        "gg": 109.0,
+        "dd": 99.0,
+        "start_index": 4,
+        "end_index": 7
+      }
+    },
+    "expected": {
+      "relation": "expansion"
+    }
+  },
+  {
+    "id": "lesson67_segment_requires_initial_three_bi_overlap",
+    "lesson": 67,
+    "source_url": "https://kline8.com/chanlun?p=67",
+    "rule": "线段划分的起点必须建立在最初三笔有重叠的前提上。",
+    "runner": "build_segments",
+    "input": {
+      "bis": [
+        {
+          "idx": 0,
+          "direction": "up",
+          "start": 100.0,
+          "end": 110.0
+        },
+        {
+          "idx": 1,
+          "direction": "down",
+          "start": 120.0,
+          "end": 112.0
+        },
+        {
+          "idx": 2,
+          "direction": "up",
+          "start": 113.0,
+          "end": 125.0
+        }
+      ]
+    },
+    "expected": {
+      "count": 0
+    }
+  },
+  {
+    "id": "lesson20_b3_exists_only_after_departure_and_non_reentry_pullback",
+    "lesson": 20,
+    "source_url": "https://kline8.com/chanlun?p=20",
+    "rule": "第三类买点要求离开中枢后第一次回抽不重新进入中枢。",
+    "runner": "generate_signals",
+    "input": {
+      "market_trend": "up",
+      "zhongshu": {
+        "zd": 98.0,
+        "zg": 102.0,
+        "gg": 110.0,
+        "dd": 92.0,
+        "g": 102.0,
+        "d": 98.0,
+        "start_index": 0,
+        "end_index": 2,
+        "time_idx": 2
+      },
+      "bis_context": [
+        {
+          "idx": 1,
+          "direction": "down",
+          "start": 103.0,
+          "end": 99.0
+        },
+        {
+          "idx": 2,
+          "direction": "up",
+          "start": 100.0,
+          "end": 108.0
+        },
+        {
+          "idx": 3,
+          "direction": "down",
+          "start": 107.0,
+          "end": 103.0
+        },
+        {
+          "idx": 4,
+          "direction": "up",
+          "start": 104.0,
+          "end": 112.0
+        }
+      ]
+    },
+    "expected": {
+      "present": [
+        "B3"
+      ],
+      "absent": [
+        "S3"
+      ]
+    }
+  },
+  {
+    "id": "lesson20_b3_false_when_pullback_returns_into_center",
+    "lesson": 20,
+    "source_url": "https://kline8.com/chanlun?p=20",
+    "rule": "第一次回抽重新进入中枢，不构成第三类买点。",
+    "runner": "generate_signals",
+    "input": {
+      "market_trend": "up",
+      "zhongshu": {
+        "zd": 98.0,
+        "zg": 102.0,
+        "gg": 110.0,
+        "dd": 92.0,
+        "g": 102.0,
+        "d": 98.0,
+        "start_index": 0,
+        "end_index": 2,
+        "time_idx": 2
+      },
+      "bis_context": [
+        {
+          "idx": 1,
+          "direction": "down",
+          "start": 103.0,
+          "end": 99.0
+        },
+        {
+          "idx": 2,
+          "direction": "up",
+          "start": 100.0,
+          "end": 108.0
+        },
+        {
+          "idx": 3,
+          "direction": "down",
+          "start": 107.0,
+          "end": 101.0
+        }
+      ]
+    },
+    "expected": {
+      "present": [],
+      "absent": [
+        "B3"
+      ]
+    }
+  },
+  {
+    "id": "lesson20_departure_must_start_after_center_end",
+    "lesson": 20,
+    "source_url": "https://kline8.com/chanlun?p=20",
+    "rule": "离开中枢的走势不能拿构成中枢尾部的那一笔直接冒充。",
+    "runner": "generate_signals",
+    "input": {
+      "market_trend": "up",
+      "zhongshu": {
+        "zd": 98.0,
+        "zg": 102.0,
+        "gg": 110.0,
+        "dd": 92.0,
+        "g": 102.0,
+        "d": 98.0,
+        "start_index": 0,
+        "end_index": 4,
+        "time_idx": 2
+      },
+      "bis_context": [
+        {
+          "idx": 3,
+          "direction": "up",
+          "start": 100.0,
+          "end": 108.0
+        },
+        {
+          "idx": 4,
+          "direction": "down",
+          "start": 107.0,
+          "end": 103.0
+        },
+        {
+          "idx": 5,
+          "direction": "up",
+          "start": 104.0,
+          "end": 112.0
+        }
+      ]
+    },
+    "expected": {
+      "present": [],
+      "absent": [
+        "B3"
+      ]
+    }
+  },
+  {
+    "id": "lesson53_first_class_preferred_when_b1_and_b2_coexist",
+    "lesson": 53,
+    "source_url": "https://kline8.com/chanlun?p=53",
+    "rule": "同级别有一买时一买最佳，二买只是补充。",
+    "runner": "decide_action",
+    "input": {
+      "chan_mode": "orthodox_chan",
+      "min_confidence": 0.6,
+      "conflict_level": "none",
+      "market_state": {
+        "trend_type": "down",
+        "phase": "trending"
+      },
+      "signals": [
+        {
+          "type": "B1",
+          "level": "main",
+          "confidence": 0.85,
+          "event_idx": 4,
+          "available_idx": 4
+        },
+        {
+          "type": "B2",
+          "level": "sub",
+          "confidence": 0.97,
+          "event_idx": 5,
+          "available_idx": 5
+        }
+      ]
+    },
+    "expected": {
+      "decision": "buy",
+      "reason_contains": "第一类买点（B1）"
+    }
+  },
+  {
+    "id": "lesson53_third_class_signal_only_once_per_center",
+    "lesson": 53,
+    "source_url": "https://kline8.com/chanlun?p=53",
+    "rule": "第三类买卖点对应的是中枢结束的第一次有效确认，同一中枢不应重复执行。",
+    "runner": "suppress_seen_signal_events",
+    "input": {
+      "chan_mode": "orthodox_chan",
+      "min_confidence": 0.6,
+      "first": {
+        "type": "S3",
+        "event_idx": 5,
+        "available_idx": 6,
+        "center_start": 7,
+        "center_end": 9
+      },
+      "second": {
+        "type": "S3",
+        "event_idx": 6,
+        "available_idx": 7,
+        "center_start": 7,
+        "center_end": 9
+      }
+    },
+    "expected": {
+      "first_decision": "sell",
+      "second_decision": "hold",
+      "second_signal_count": 0
+    }
+  },
+  {
+    "id": "lesson53_first_class_signal_only_once_per_center_until_invalidated",
+    "lesson": 53,
+    "source_url": "https://kline8.com/chanlun?p=53",
+    "rule": "同一中枢的一类买点在失效前不应重复执行，未跌破失效价前后续同中枢一类点应被压制。",
+    "runner": "suppress_seen_signal_events",
+    "input": {
+      "chan_mode": "orthodox_chan",
+      "min_confidence": 0.6,
+      "first_asof_low": 101.0,
+      "first_asof_high": 110.0,
+      "second_asof_low": 104.0,
+      "second_asof_high": 112.0,
+      "first": {
+        "type": "B1",
+        "event_idx": 5,
+        "available_idx": 6,
+        "center_start": 7,
+        "center_end": 9,
+        "invalid_price": 100.0
+      },
+      "second": {
+        "type": "B1",
+        "event_idx": 8,
+        "available_idx": 9,
+        "center_start": 7,
+        "center_end": 9,
+        "invalid_price": 105.0
+      }
+    },
+    "expected": {
+      "first_decision": "buy",
+      "second_decision": "hold",
+      "second_signal_count": 0
+    }
+  }
+]

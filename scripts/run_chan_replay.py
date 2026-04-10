@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from _script_utils import ensure_src_on_path, write_csv_rows
@@ -12,10 +12,11 @@ from _script_utils import ensure_src_on_path, write_csv_rows
 ensure_src_on_path()
 
 from ai_trader.chan import build_chan_state, generate_signal
+from ai_trader.chan.engine import suppress_seen_signal_events
 from ai_trader.chan.config import get_chan_config
 from ai_trader.data.binance_ohlcv import load_ohlcv
 from ai_trader.indicators import compute_macd
-from ai_trader.types import iso_utc
+from ai_trader.types import iso_utc, parse_utc_time
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,8 +29,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeframe-sub", default="1h")
     parser.add_argument("--start", default="2024-01-01T00:00:00Z")
     parser.add_argument("--end", default="2025-12-31T23:59:59Z")
-    parser.add_argument("--chan-mode", default="strict_kline8", choices=("strict_kline8", "orthodox_chan", "pragmatic"))
+    parser.add_argument("--chan-mode", default="orthodox_chan", choices=("strict_kline8", "orthodox_chan", "pragmatic"))
     parser.add_argument("--warmup-bars", type=int, default=120)
+    parser.add_argument("--history-lookback-days", type=int, default=365)
     parser.add_argument(
         "--tail-bars",
         type=int,
@@ -123,11 +125,14 @@ def main() -> None:
     args = parse_args()
     cfg = get_chan_config(args.chan_mode)
 
+    eval_start = parse_utc_time(args.start)
+    load_start = iso_utc(eval_start - timedelta(days=args.history_lookback_days))
+
     bars_main = load_ohlcv(
-        args.exchange, args.symbol, args.timeframe_main, args.start, args.end
+        args.exchange, args.symbol, args.timeframe_main, load_start, args.end
     )
     bars_sub = load_ohlcv(
-        args.exchange, args.symbol, args.timeframe_sub, args.start, args.end
+        args.exchange, args.symbol, args.timeframe_sub, load_start, args.end
     )
     bars_main.sort(key=lambda x: x.time)
     bars_sub.sort(key=lambda x: x.time)
@@ -143,12 +148,19 @@ def main() -> None:
     rows: list[dict] = []
     focus_rows: list[dict] = []
     action_counter: Counter[str] = Counter()
+    seen_signal_keys: set[tuple] = set()
+    turning_signal_guards: dict[tuple, dict[str, object]] = {}
     signal_counter: Counter[str] = Counter()
     phase_counter: Counter[str] = Counter()
     conflict_counter: Counter[str] = Counter()
 
     sub_cursor = 0
-    for i in range(args.warmup_bars, len(bars_main)):
+    eval_start_idx = next(
+        (i for i, item in enumerate(bars_main) if item.time >= eval_start),
+        len(bars_main),
+    )
+    start_index = max(args.warmup_bars, eval_start_idx)
+    for i in range(start_index, len(bars_main)):
         bar = bars_main[i]
         while sub_cursor < len(bars_sub) and bars_sub[sub_cursor].time <= bar.time:
             sub_cursor += 1
@@ -166,6 +178,15 @@ def main() -> None:
             chan_config=cfg,
         )
         decision = generate_signal(snapshot=snapshot, chan_config=cfg)
+        decision = suppress_seen_signal_events(
+            decision=decision,
+            seen_signal_keys=seen_signal_keys,
+            chan_config=cfg,
+            min_confidence=cfg.min_confidence,
+            active_turning_guards=turning_signal_guards,
+            asof_low=bar.low,
+            asof_high=bar.high,
+        )
         payload = decision.to_contract_dict()
         row = _replay_row(snapshot, payload, asof_close=bar.close)
         rows.append(row)
@@ -199,6 +220,7 @@ def main() -> None:
         "chan_mode": args.chan_mode,
         "period": {"start": args.start, "end": args.end},
         "warmup_bars": args.warmup_bars,
+        "history_lookback_days": args.history_lookback_days,
         "counts": {
             "rows": len(rows),
             "focus_rows": len(focus_rows),
@@ -222,6 +244,7 @@ def main() -> None:
         f"- chan_mode: {args.chan_mode}",
         f"- period: {args.start} -> {args.end}",
         f"- warmup_bars: {args.warmup_bars}",
+        f"- history_lookback_days: {args.history_lookback_days}",
         f"- replay_rows: {len(rows)}",
         f"- focus_rows: {len(focus_rows)}",
         "",

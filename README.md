@@ -66,7 +66,7 @@ uv run python -m unittest discover -s tests -p "test_*.py"
 - `risk.conflict_level`: `none | low | high`
 - `cn_summary`: 中文结论
 
-## 执行过滤规则（strict_kline8 默认）
+## 执行过滤规则（orthodox_chan 默认）
 
 信号会完整输出，但动作层默认执行保守过滤：
 
@@ -74,7 +74,7 @@ uv run python -m unittest discover -s tests -p "test_*.py"
 - 买入冲突约束：`conflict_level` 不能为 `high`
 - 中阴阶段：默认 `wait`；仅出现明确三类点（`B3/S3`）才允许突破默认等待
 - 减仓：使用 `S2/S3`，且默认只在 `conflict_level=high` 时触发
-- `strict_kline8` 仍以保守确认和高冲突约束为主，不直接把减仓信号当作开空信号
+- `orthodox_chan` 现在是默认正统模式；`strict_kline8` 仍保留更保守的确认和高冲突过滤，不直接把减仓信号当作开空信号
 
 ## 结构诊断（真实 BTC 行情）
 

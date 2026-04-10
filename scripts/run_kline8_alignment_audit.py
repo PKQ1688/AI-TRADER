@@ -13,6 +13,7 @@ from _script_utils import ensure_src_on_path, write_csv_rows
 ensure_src_on_path()
 
 from ai_trader.chan import build_chan_state, generate_signal
+from ai_trader.chan.core.buy_sell_points import allow_high_conflict_reversal
 from ai_trader.data.binance_ohlcv import load_ohlcv
 from ai_trader.types import Bi, Zhongshu, iso_utc
 
@@ -110,6 +111,18 @@ def _rule_s1(bis_main: list[Bi]) -> tuple[bool, str]:
     return ok, f"prev_end={prev_bi.end_price:.2f}, cur_end={cur_bi.end_price:.2f}"
 
 
+def _primary_reversal_signal(decision, action: str):
+    if action == "buy":
+        for sig in decision.signals:
+            if sig.type in {"B1", "B2", "B3"}:
+                return sig
+    if action == "sell":
+        for sig in decision.signals:
+            if sig.type in {"S1", "S2", "S3"}:
+                return sig
+    return None
+
+
 def main() -> None:
     args = parse_args()
 
@@ -147,7 +160,10 @@ def main() -> None:
         action_counter[action] += 1
         conflict_counter[conflict] += 1
 
-        if conflict == "high" and action not in {"wait", "reduce"}:
+        primary_signal = _primary_reversal_signal(decision, action)
+        allow_high_conflict_action = allow_high_conflict_reversal(primary_signal, decision.market_state)
+
+        if conflict == "high" and action not in {"wait", "reduce"} and not allow_high_conflict_action:
             policy_violations["high_conflict_action"].append((iso_utc(asof), action, sorted(sig_types)))
         if phase == "transitional" and action != "wait" and not (sig_types & {"B3", "S3"}):
             policy_violations["transitional_without_b3s3"].append((iso_utc(asof), action, sorted(sig_types)))

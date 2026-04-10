@@ -137,11 +137,11 @@ def infer_market_state(
             and item.available_time > trend_tail_zs.available_time
         ]
         has_later_centers = trend_cur_idx < len(zhongshus) - 1
-        has_transition_segments = (
-            len(post_center_segments) >= 2
-            and post_center_segments[-1].direction != post_center_segments[-2].direction
+        reentered_trend_center = any(
+            _segment_overlaps_center(item, trend_tail_zs)
+            for item in post_center_segments
         )
-        if has_later_centers or has_transition_segments:
+        if has_later_centers or reentered_trend_center:
             phase = "transitional"
             oscillation_anchor = trend_tail_zs
             oscillation_anchor_source = "prior_trend_center"

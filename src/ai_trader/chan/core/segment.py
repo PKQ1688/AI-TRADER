@@ -160,6 +160,20 @@ def _find_segment_end(
     return None, None
 
 
+def _provisional_segment(sl: list[Bi]) -> Segment:
+    tail = sl[-1]
+    return Segment(
+        direction=sl[0].direction,
+        start_index=sl[0].start_index,
+        end_index=tail.end_index,
+        high=max(item.high for item in sl),
+        low=min(item.low for item in sl),
+        event_time=tail.event_time,
+        available_time=max(item.available_time for item in sl),
+        status="provisional",
+    )
+
+
 def build_segments(
     bis: list[Bi], require_case2_confirmation: bool = True
 ) -> list[Segment]:
@@ -170,25 +184,15 @@ def build_segments(
     cursor = 0
     while cursor + 2 < len(bis):
         if not _has_three_overlap(bis[cursor], bis[cursor + 1], bis[cursor + 2]):
+            if segments:
+                segments.append(_provisional_segment(bis[cursor:]))
+                break
             cursor += 1
             continue
 
         end_idx, _ = _find_segment_end(bis, cursor, require_case2_confirmation)
         if end_idx is None or end_idx <= cursor:
-            tail = bis[-1]
-            sl = bis[cursor:]
-            segments.append(
-                Segment(
-                    direction=bis[cursor].direction,
-                    start_index=sl[0].start_index,
-                    end_index=tail.end_index,
-                    high=max(item.high for item in sl),
-                    low=min(item.low for item in sl),
-                    event_time=tail.event_time,
-                    available_time=max(item.available_time for item in sl),
-                    status="provisional",
-                )
-            )
+            segments.append(_provisional_segment(bis[cursor:]))
             break
 
         sl = bis[cursor : end_idx + 1]
@@ -205,6 +209,8 @@ def build_segments(
                 status="confirmed",
             )
         )
-        cursor = end_idx + 1
+        # Consecutive segments share the boundary bi; advancing past it can
+        # incorrectly emit multiple same-direction segments.
+        cursor = end_idx
 
     return segments

@@ -5,8 +5,8 @@ from ai_trader.types import Bar, Bi, Fractal
 
 def _pick_extreme_same_kind(current: Fractal, incoming: Fractal) -> Fractal:
     if current.kind == "top":
-        return incoming if incoming.price >= current.price else current
-    return incoming if incoming.price <= current.price else current
+        return incoming if incoming.price > current.price else current
+    return incoming if incoming.price < current.price else current
 
 
 def _valid_bi_pair(
@@ -27,9 +27,16 @@ def _valid_bi_pair(
     if gap < 4:
         return False
 
+    start_bar = bars[start.index]
+    end_bar = bars[end.index]
+
     if start.kind == "bottom" and end.price <= start.price:
         return False
     if start.kind == "top" and end.price >= start.price:
+        return False
+    if start.kind == "bottom" and end_bar.high <= start_bar.high:
+        return False
+    if start.kind == "top" and end_bar.low >= start_bar.low:
         return False
 
     return True

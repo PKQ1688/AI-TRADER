@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from collections.abc import Sequence
 
 from ai_trader.chan.config import ChanConfig, get_chan_config
@@ -8,7 +10,7 @@ from ai_trader.chan.core.buy_sell_points import (
     decide_action,
     generate_signals,
 )
-from ai_trader.chan.core.center import build_zhongshus, build_zhongshus_from_bis
+from ai_trader.chan.core.center import build_zhongshus_from_bis
 from ai_trader.chan.core.divergence import detect_divergence_candidates
 from ai_trader.chan.core.fractal import detect_fractals
 from ai_trader.chan.core.include import merge_inclusions
@@ -23,6 +25,7 @@ from ai_trader.types import (
     DataQuality,
     MACDPoint,
     MarketState,
+    Signal,
     SignalDecision,
     parse_utc_time,
 )
@@ -105,7 +108,7 @@ def build_chan_state(
     timeframe_sub: str = "1h",
     chan_config: ChanConfig | None = None,
 ) -> ChanSnapshot:
-    cfg = chan_config or get_chan_config("strict_kline8")
+    cfg = chan_config or get_chan_config("orthodox_chan")
     asof = parse_utc_time(asof_time)
 
     raw_main = _bars_until(bars_main, asof)
@@ -142,8 +145,8 @@ def build_chan_state(
         bis_sub, require_case2_confirmation=cfg.require_case2_confirmation
     )
 
-    zhongshus_main = build_zhongshus(segments_main)
-    zhongshus_sub = build_zhongshus(segments_sub)
+    zhongshus_main = build_zhongshus_from_bis(bis_main)
+    zhongshus_sub = build_zhongshus_from_bis(bis_sub)
 
     normalized_macd_main = _normalize_macd(macd_main, raw_main)
     normalized_macd_sub = _normalize_macd(macd_sub, raw_sub)
@@ -195,6 +198,145 @@ def _conflict_level(snapshot: ChanSnapshot) -> tuple[str, str]:
     return "high", "主次级别方向冲突"
 
 
+def _signal_event_key(signal: Signal) -> tuple:
+    if signal.type in {"B3", "S3"} and signal.anchor_center_start_index is not None:
+        return (
+            signal.type,
+            signal.level,
+            signal.anchor_center_start_index,
+            signal.anchor_center_end_index,
+        )
+    return (
+        signal.type,
+        signal.level,
+        signal.anchor_center_start_index,
+        signal.anchor_center_end_index,
+        signal.event_time,
+    )
+
+
+def _turning_signal_guard_key(signal: Signal) -> tuple | None:
+    if signal.type not in {"B1", "B2", "S1", "S2"}:
+        return None
+    if signal.anchor_center_start_index is None:
+        return None
+    side = "buy" if signal.type.startswith("B") else "sell"
+    return side, signal.anchor_center_start_index, signal.anchor_center_end_index
+
+
+def _expire_turning_signal_guards(
+    active_turning_guards: dict[tuple, dict[str, object]],
+    asof_low: float | None,
+    asof_high: float | None,
+) -> None:
+    expired: list[tuple] = []
+    for key, state in active_turning_guards.items():
+        invalid_price = state.get("invalid_price")
+        if invalid_price is None:
+            continue
+        side = key[0]
+        if side == "buy" and asof_low is not None and asof_low <= float(invalid_price):
+            expired.append(key)
+        elif side == "sell" and asof_high is not None and asof_high >= float(invalid_price):
+            expired.append(key)
+
+    for key in expired:
+        active_turning_guards.pop(key, None)
+
+
+def _keep_turning_signal(
+    signal: Signal,
+    active_turning_guards: dict[tuple, dict[str, object]],
+) -> bool:
+    key = _turning_signal_guard_key(signal)
+    if key is None:
+        return True
+
+    state = active_turning_guards.get(key)
+    if state is None:
+        return True
+
+    emitted_types = state.get("emitted_types", set())
+    if signal.type in emitted_types:
+        return False
+
+    if signal.type in {"B1", "S1"}:
+        return False
+
+    return True
+
+
+def _remember_turning_signal(
+    signal: Signal,
+    active_turning_guards: dict[tuple, dict[str, object]],
+) -> None:
+    key = _turning_signal_guard_key(signal)
+    if key is None:
+        return
+
+    state = active_turning_guards.setdefault(
+        key,
+        {"invalid_price": signal.invalid_price, "emitted_types": set()},
+    )
+    emitted_types = state.get("emitted_types")
+    if not isinstance(emitted_types, set):
+        emitted_types = set(emitted_types or [])
+        state["emitted_types"] = emitted_types
+    emitted_types.add(signal.type)
+    if signal.invalid_price is not None:
+        state["invalid_price"] = signal.invalid_price
+
+
+def suppress_seen_signal_events(
+    decision: SignalDecision,
+    seen_signal_keys: set[tuple],
+    chan_config: ChanConfig,
+    min_confidence: float,
+    active_turning_guards: dict[tuple, dict[str, object]] | None = None,
+    asof_low: float | None = None,
+    asof_high: float | None = None,
+) -> SignalDecision:
+    if active_turning_guards is not None:
+        _expire_turning_signal_guards(active_turning_guards, asof_low, asof_high)
+
+    if not decision.signals:
+        return decision
+
+    kept = []
+    new_keys = []
+    turning_to_remember = []
+    for item in decision.signals:
+        if active_turning_guards is not None and not _keep_turning_signal(
+            item, active_turning_guards
+        ):
+            continue
+        key = _signal_event_key(item)
+        if key in seen_signal_keys:
+            continue
+        kept.append(item)
+        new_keys.append(key)
+        if active_turning_guards is not None and _turning_signal_guard_key(item) is not None:
+            turning_to_remember.append(item)
+
+    for key in new_keys:
+        seen_signal_keys.add(key)
+    if active_turning_guards is not None:
+        for item in turning_to_remember:
+            _remember_turning_signal(item, active_turning_guards)
+
+    if len(kept) == len(decision.signals):
+        return decision
+
+    action, summary = decide_action(
+        kept,
+        decision.market_state,
+        decision.risk.conflict_level,
+        min_confidence,
+        chan_config,
+    )
+    return replace(decision, signals=kept, action=action, cn_summary=summary)
+
+
 def _fresh_signals(snapshot: ChanSnapshot, signals):
     if not signals:
         return []
@@ -241,8 +383,8 @@ def _sub_interval_confirmed(
         macd=snapshot.macd_sub,
         threshold=threshold,
         zhongshus=sub_zhongshus,
-        allow_consolidation_fallback=getattr(
-            cfg, "allow_consolidation_divergence_fallback", False
+        include_consolidation_divergence_hint=getattr(
+            cfg, "include_consolidation_divergence_hint", False
         ),
         consolidation_anchor=sub_consolidation_anchor,
     )
@@ -256,6 +398,7 @@ def _sub_interval_confirmed(
         macd_missing=len(snapshot.macd_sub) == 0,
         missing_macd_penalty=cfg.missing_macd_penalty,
         transitional_confidence_cap=cfg.transitional_confidence_cap,
+        bis_context=snapshot.bis_sub,
     )
 
     snapshot_anchor_time = (
@@ -314,13 +457,19 @@ def _oscillation_note(market_state: MarketState) -> str:
     return ""
 
 
+def _consolidation_divergence_note(candidates) -> str:
+    if any(getattr(item, "mode", None) == "consolidation" for item in candidates):
+        return "检测到单中枢盘整背驰，仅作低级别买卖点确认背景，不直接视为本级别一类买卖点"
+    return ""
+
+
 def generate_signal(
     snapshot: ChanSnapshot,
     macd_divergence_threshold: float = 0.10,
     min_confidence: float = 0.60,
     chan_config: ChanConfig | None = None,
 ) -> SignalDecision:
-    cfg = chan_config or get_chan_config("strict_kline8")
+    cfg = chan_config or get_chan_config("orthodox_chan")
     threshold = (
         macd_divergence_threshold
         if macd_divergence_threshold > 0
@@ -350,7 +499,7 @@ def generate_signal(
         macd=snapshot.macd_main,
         threshold=threshold,
         zhongshus=snapshot.zhongshus_main,
-        allow_consolidation_fallback=cfg.allow_consolidation_divergence_fallback,
+        include_consolidation_divergence_hint=cfg.include_consolidation_divergence_hint,
         consolidation_anchor=next(
             (
                 item
@@ -374,15 +523,20 @@ def generate_signal(
         macd_missing=macd_missing,
         missing_macd_penalty=cfg.missing_macd_penalty,
         transitional_confidence_cap=cfg.transitional_confidence_cap,
+        bis_context=snapshot.bis_main,
     )
 
     fresh_signals = _fresh_signals(snapshot, signals)
 
     conflict_level, conflict_note = _conflict_level(snapshot)
     oscillation_note = _oscillation_note(market_state)
-    risk_note = (
-        f"{conflict_note}；{oscillation_note}" if oscillation_note else conflict_note
-    )
+    consolidation_note = _consolidation_divergence_note(divergence)
+    risk_parts = [conflict_note]
+    if oscillation_note:
+        risk_parts.append(oscillation_note)
+    if consolidation_note:
+        risk_parts.append(consolidation_note)
+    risk_note = "；".join(risk_parts)
     action, summary = decide_action(
         fresh_signals, market_state, conflict_level, confidence_floor, cfg
     )
