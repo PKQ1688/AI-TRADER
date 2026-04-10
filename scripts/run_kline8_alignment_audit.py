@@ -13,9 +13,12 @@ from _script_utils import ensure_src_on_path, write_csv_rows
 ensure_src_on_path()
 
 from ai_trader.chan import build_chan_state, generate_signal
+from ai_trader.chan.config import get_chan_config
 from ai_trader.chan.core.buy_sell_points import allow_high_conflict_reversal
+from ai_trader.chan.core.divergence import _find_trend_segments
+from ai_trader.chan.engine import suppress_seen_signal_events
 from ai_trader.data.binance_ohlcv import load_ohlcv
-from ai_trader.types import Bi, Zhongshu, iso_utc
+from ai_trader.types import Bi, Signal, Zhongshu, iso_utc
 
 
 @dataclass(slots=True)
@@ -52,8 +55,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbol", default="BTC/USDT")
     parser.add_argument("--timeframe-main", default="4h")
     parser.add_argument("--timeframe-sub", default="1h")
+    parser.add_argument(
+        "--chan-mode",
+        default="orthodox_chan",
+        choices=("strict_kline8", "orthodox_chan", "pragmatic"),
+    )
     parser.add_argument("--start", default="2024-01-01T00:00:00Z")
     parser.add_argument("--end", default="2025-12-31T23:59:59Z")
+    parser.add_argument("--warmup-bars", type=int, default=120)
     parser.add_argument("--output-root", default="outputs/diagnostics")
     return parser.parse_args()
 
@@ -65,50 +74,119 @@ def _latest_pair(bis: list[Bi], direction: str) -> tuple[Bi, Bi] | None:
     return arr[-2], arr[-1]
 
 
-def _rule_b3(last_close: float, last_bi: Bi | None, zs: Zhongshu | None) -> tuple[bool, str]:
+def _anchor_key(signal: Signal) -> tuple[str, int | None, int | None]:
+    side = "buy" if signal.type.startswith("B") else "sell"
+    return side, signal.anchor_center_start_index, signal.anchor_center_end_index
+
+
+def _resolve_anchor_center(
+    signal: Signal,
+    zhongshus: list[Zhongshu],
+    fallback: Zhongshu | None,
+) -> Zhongshu | None:
+    start_idx = signal.anchor_center_start_index
+    end_idx = signal.anchor_center_end_index
+    if start_idx is not None and end_idx is not None:
+        for item in zhongshus:
+            if item.start_index == start_idx and item.end_index == end_idx:
+                return item
+    return fallback
+
+
+def _rule_b3(
+    last_close: float,
+    last_bi: Bi | None,
+    signal: Signal,
+    zhongshus: list[Zhongshu],
+    fallback: Zhongshu | None,
+) -> tuple[bool, str]:
+    zs = _resolve_anchor_center(signal, zhongshus, fallback)
     if zs is None or last_bi is None:
-        return False, "missing last_zs/last_bi"
+        return False, "missing anchor_center/last_bi"
     ok = last_bi.direction == "up" and last_close > zs.zg
-    return ok, f"last_bi_dir={last_bi.direction}, close={last_close:.2f}, zg={zs.zg:.2f}"
+    return ok, f"last_bi_dir={last_bi.direction}, close={last_close:.2f}, anchor_zg={zs.zg:.2f}"
 
 
-def _rule_s3(last_close: float, last_bi: Bi | None, zs: Zhongshu | None) -> tuple[bool, str]:
+def _rule_s3(
+    last_close: float,
+    last_bi: Bi | None,
+    signal: Signal,
+    zhongshus: list[Zhongshu],
+    fallback: Zhongshu | None,
+) -> tuple[bool, str]:
+    zs = _resolve_anchor_center(signal, zhongshus, fallback)
     if zs is None or last_bi is None:
-        return False, "missing last_zs/last_bi"
+        return False, "missing anchor_center/last_bi"
     ok = last_bi.direction == "down" and last_close < zs.zd
-    return ok, f"last_bi_dir={last_bi.direction}, close={last_close:.2f}, zd={zs.zd:.2f}"
+    return ok, f"last_bi_dir={last_bi.direction}, close={last_close:.2f}, anchor_zd={zs.zd:.2f}"
 
 
-def _rule_b2(sig_types: set[str], bis_sub: list[Bi]) -> tuple[bool, str]:
+def _rule_b2(
+    signal: Signal,
+    first_class_keys: set[tuple[str, int | None, int | None]],
+    bis_sub: list[Bi],
+) -> tuple[bool, str]:
     if len(bis_sub) < 2:
         return False, "sub_bis<2"
-    ok = "B1" in sig_types and bis_sub[-2].direction == "down" and bis_sub[-1].direction == "up"
-    return ok, f"has_B1={'B1' in sig_types}, sub_pair={bis_sub[-2].direction}->{bis_sub[-1].direction}"
+    anchor_key = _anchor_key(signal)
+    ok = anchor_key in first_class_keys and bis_sub[-2].direction == "down" and bis_sub[-1].direction == "up"
+    return ok, f"has_prior_B1={anchor_key in first_class_keys}, anchor={anchor_key}, sub_pair={bis_sub[-2].direction}->{bis_sub[-1].direction}"
 
 
-def _rule_s2(sig_types: set[str], bis_sub: list[Bi]) -> tuple[bool, str]:
+def _rule_s2(
+    signal: Signal,
+    first_class_keys: set[tuple[str, int | None, int | None]],
+    bis_sub: list[Bi],
+) -> tuple[bool, str]:
     if len(bis_sub) < 2:
         return False, "sub_bis<2"
-    ok = "S1" in sig_types and bis_sub[-2].direction == "up" and bis_sub[-1].direction == "down"
-    return ok, f"has_S1={'S1' in sig_types}, sub_pair={bis_sub[-2].direction}->{bis_sub[-1].direction}"
+    anchor_key = _anchor_key(signal)
+    ok = anchor_key in first_class_keys and bis_sub[-2].direction == "up" and bis_sub[-1].direction == "down"
+    return ok, f"has_prior_S1={anchor_key in first_class_keys}, anchor={anchor_key}, sub_pair={bis_sub[-2].direction}->{bis_sub[-1].direction}"
 
 
-def _rule_b1(bis_main: list[Bi]) -> tuple[bool, str]:
-    pair = _latest_pair(bis_main, "down")
-    if pair is None:
-        return False, "main_down_pair<2"
-    prev_bi, cur_bi = pair
-    ok = cur_bi.end_price < prev_bi.end_price
-    return ok, f"prev_end={prev_bi.end_price:.2f}, cur_end={cur_bi.end_price:.2f}"
+def _rule_b1(signal: Signal, bis_main: list[Bi], zhongshus: list[Zhongshu]) -> tuple[bool, str]:
+    result = _find_trend_segments(bis_main, zhongshus, "down")
+    if result is None:
+        return False, "missing a+A+b+B+c"
+    _, _, a_dir_bis, c_dir_bis, _, B_zs = result
+    if not a_dir_bis or not c_dir_bis:
+        return False, "missing a/c leg"
+    a_extreme = min(bi.end_price for bi in a_dir_bis)
+    c_extreme = min(bi.end_price for bi in c_dir_bis)
+    cur_bi = c_dir_bis[-1]
+    anchor_ok = (
+        signal.anchor_center_start_index == B_zs.start_index
+        and signal.anchor_center_end_index == B_zs.end_index
+    )
+    event_ok = signal.event_time == cur_bi.event_time
+    ok = c_extreme < a_extreme and anchor_ok and event_ok
+    return ok, (
+        f"a_extreme={a_extreme:.2f}, c_extreme={c_extreme:.2f}, "
+        f"anchor_ok={anchor_ok}, event_ok={event_ok}"
+    )
 
 
-def _rule_s1(bis_main: list[Bi]) -> tuple[bool, str]:
-    pair = _latest_pair(bis_main, "up")
-    if pair is None:
-        return False, "main_up_pair<2"
-    prev_bi, cur_bi = pair
-    ok = cur_bi.end_price > prev_bi.end_price
-    return ok, f"prev_end={prev_bi.end_price:.2f}, cur_end={cur_bi.end_price:.2f}"
+def _rule_s1(signal: Signal, bis_main: list[Bi], zhongshus: list[Zhongshu]) -> tuple[bool, str]:
+    result = _find_trend_segments(bis_main, zhongshus, "up")
+    if result is None:
+        return False, "missing a+A+b+B+c"
+    _, _, a_dir_bis, c_dir_bis, _, B_zs = result
+    if not a_dir_bis or not c_dir_bis:
+        return False, "missing a/c leg"
+    a_extreme = max(bi.end_price for bi in a_dir_bis)
+    c_extreme = max(bi.end_price for bi in c_dir_bis)
+    cur_bi = c_dir_bis[-1]
+    anchor_ok = (
+        signal.anchor_center_start_index == B_zs.start_index
+        and signal.anchor_center_end_index == B_zs.end_index
+    )
+    event_ok = signal.event_time == cur_bi.event_time
+    ok = c_extreme > a_extreme and anchor_ok and event_ok
+    return ok, (
+        f"a_extreme={a_extreme:.2f}, c_extreme={c_extreme:.2f}, "
+        f"anchor_ok={anchor_ok}, event_ok={event_ok}"
+    )
 
 
 def _primary_reversal_signal(decision, action: str):
@@ -125,6 +203,7 @@ def _primary_reversal_signal(decision, action: str):
 
 def main() -> None:
     args = parse_args()
+    cfg = get_chan_config(args.chan_mode)
 
     bars_main = load_ohlcv(args.exchange, args.symbol, args.timeframe_main, args.start, args.end)
     bars_sub = load_ohlcv(args.exchange, args.symbol, args.timeframe_sub, args.start, args.end)
@@ -134,74 +213,98 @@ def main() -> None:
     conflict_counter = Counter()
     policy_violations = defaultdict(list)
     signal_rows: list[SignalAuditRow] = []
+    seen_signal_keys: set[tuple] = set()
+    turning_signal_guards: dict[tuple, dict[str, object]] = {}
+    emitted_first_class_keys: set[tuple[str, int | None, int | None]] = set()
 
-    for i in range(120, len(bars_main)):
-        asof = bars_main[i].time
-        sub = [b for b in bars_sub if b.time <= asof]
+    sub_cursor = 0
+    start_index = max(args.warmup_bars, cfg.min_main_bars)
+    for i in range(start_index, len(bars_main)):
+        asof_bar = bars_main[i]
+        while sub_cursor < len(bars_sub) and bars_sub[sub_cursor].time <= asof_bar.time:
+            sub_cursor += 1
+
         snap = build_chan_state(
             bars_main=bars_main[: i + 1],
-            bars_sub=sub,
+            bars_sub=bars_sub[:sub_cursor],
             macd_main=None,
             macd_sub=None,
-            asof_time=asof,
+            asof_time=asof_bar.time,
             exchange=args.exchange,
             symbol=args.symbol,
             timeframe_main=args.timeframe_main,
             timeframe_sub=args.timeframe_sub,
+            chan_config=cfg,
         )
-        decision = generate_signal(snap)
+        decision = generate_signal(snapshot=snap, chan_config=cfg)
+        decision = suppress_seen_signal_events(
+            decision=decision,
+            seen_signal_keys=seen_signal_keys,
+            chan_config=cfg,
+            min_confidence=cfg.min_confidence,
+            active_turning_guards=turning_signal_guards,
+            asof_low=asof_bar.low,
+            asof_high=asof_bar.high,
+        )
         payload = decision.to_contract_dict()
 
         action = payload["action"]["decision"]
         conflict = payload["risk"]["conflict_level"]
         phase = payload["market_state"]["phase"]
-        sig_types = {item["type"] for item in payload["signals"]}
+        signal_objects = list(decision.signals)
+        signal_payloads = list(payload["signals"])
+        sig_types = {item.type for item in signal_objects}
 
         action_counter[action] += 1
         conflict_counter[conflict] += 1
 
         primary_signal = _primary_reversal_signal(decision, action)
-        allow_high_conflict_action = allow_high_conflict_reversal(primary_signal, decision.market_state)
+        allow_reversal_action = allow_high_conflict_reversal(primary_signal, decision.market_state)
 
-        if conflict == "high" and action not in {"wait", "reduce"} and not allow_high_conflict_action:
-            policy_violations["high_conflict_action"].append((iso_utc(asof), action, sorted(sig_types)))
-        if phase == "transitional" and action != "wait" and not (sig_types & {"B3", "S3"}):
-            policy_violations["transitional_without_b3s3"].append((iso_utc(asof), action, sorted(sig_types)))
+        if conflict == "high" and action not in {"wait", "reduce"} and not allow_reversal_action:
+            policy_violations["high_conflict_action"].append((iso_utc(asof_bar.time), action, sorted(sig_types)))
+        if phase == "transitional" and action != "wait" and not (sig_types & {"B3", "S3"}) and not allow_reversal_action:
+            policy_violations["transitional_without_b3s3"].append((iso_utc(asof_bar.time), action, sorted(sig_types)))
 
-        for sig in payload["signals"]:
-            signal_counter[sig["type"]] += 1
+        known_first_class_keys = set(emitted_first_class_keys)
+        known_first_class_keys.update(
+            _anchor_key(item) for item in signal_objects if item.type in {"B1", "S1"}
+        )
+
+        for sig_obj, sig in zip(signal_objects, signal_payloads):
+            signal_counter[sig_obj.type] += 1
             ok = True
             detail = ""
             check_name = ""
 
-            if sig["type"] == "B1":
-                check_name = "b1_new_low"
-                ok, detail = _rule_b1(snap.bis_main)
-            elif sig["type"] == "S1":
-                check_name = "s1_new_high"
-                ok, detail = _rule_s1(snap.bis_main)
-            elif sig["type"] == "B2":
-                check_name = "b2_need_b1_sub_confirm"
-                ok, detail = _rule_b2(sig_types, snap.bis_sub)
-            elif sig["type"] == "S2":
-                check_name = "s2_need_s1_sub_confirm"
-                ok, detail = _rule_s2(sig_types, snap.bis_sub)
-            elif sig["type"] == "B3":
-                check_name = "b3_leave_center"
+            if sig_obj.type == "B1":
+                check_name = "b1_trend_new_low"
+                ok, detail = _rule_b1(sig_obj, snap.bis_main, snap.zhongshus_main)
+            elif sig_obj.type == "S1":
+                check_name = "s1_trend_new_high"
+                ok, detail = _rule_s1(sig_obj, snap.bis_main, snap.zhongshus_main)
+            elif sig_obj.type == "B2":
+                check_name = "b2_need_prior_b1_sub_confirm"
+                ok, detail = _rule_b2(sig_obj, known_first_class_keys, snap.bis_sub)
+            elif sig_obj.type == "S2":
+                check_name = "s2_need_prior_s1_sub_confirm"
+                ok, detail = _rule_s2(sig_obj, known_first_class_keys, snap.bis_sub)
+            elif sig_obj.type == "B3":
+                check_name = "b3_leave_anchor_center"
                 close = snap.bars_main[-1].close if snap.bars_main else 0.0
                 last_bi = snap.bis_main[-1] if snap.bis_main else None
-                ok, detail = _rule_b3(close, last_bi, snap.last_zhongshu_main)
-            elif sig["type"] == "S3":
-                check_name = "s3_leave_center"
+                ok, detail = _rule_b3(close, last_bi, sig_obj, snap.zhongshus_main, snap.last_zhongshu_main)
+            elif sig_obj.type == "S3":
+                check_name = "s3_leave_anchor_center"
                 close = snap.bars_main[-1].close if snap.bars_main else 0.0
                 last_bi = snap.bis_main[-1] if snap.bis_main else None
-                ok, detail = _rule_s3(close, last_bi, snap.last_zhongshu_main)
+                ok, detail = _rule_s3(close, last_bi, sig_obj, snap.zhongshus_main, snap.last_zhongshu_main)
 
             row = SignalAuditRow(
-                asof=iso_utc(asof),
-                signal_type=sig["type"],
-                level=sig["level"],
-                confidence=float(sig["confidence"]),
+                asof=iso_utc(asof_bar.time),
+                signal_type=sig_obj.type,
+                level=sig_obj.level,
+                confidence=float(sig_obj.confidence),
                 action=action,
                 conflict_level=conflict,
                 phase=phase,
@@ -212,6 +315,10 @@ def main() -> None:
             signal_rows.append(row)
             if not ok:
                 policy_violations[f"signal_check_fail:{check_name}"].append((row.asof, row.signal_type, row.detail))
+
+        emitted_first_class_keys.update(
+            _anchor_key(item) for item in signal_objects if item.type in {"B1", "S1"}
+        )
 
     run_id = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     pair_key = args.symbol.replace("/", "")
@@ -227,6 +334,7 @@ def main() -> None:
 
     summary = {
         "period": {"start": args.start, "end": args.end},
+        "chan_mode": args.chan_mode,
         "counts": {
             "bars_main": len(bars_main),
             "bars_sub": len(bars_sub),
@@ -244,6 +352,7 @@ def main() -> None:
     lines = [
         "# Kline8 对齐审计摘要",
         "",
+        f"- chan_mode: {args.chan_mode}",
         f"- period: {args.start} -> {args.end}",
         f"- bars(main/sub): {len(bars_main)}/{len(bars_sub)}",
         f"- signals: {dict(signal_counter)}",

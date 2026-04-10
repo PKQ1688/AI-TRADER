@@ -286,7 +286,7 @@ def _derive_b3(
         )
         if sequence is not None:
             pullback_bi, confirm_bi = sequence
-            if pullback_bi.low > zhongshu.zg:
+            if pullback_bi.low > zhongshu.zg and confirm_bi.low > zhongshu.zg:
                 available_time = max(confirm_bi.available_time, center_confirmed_at)
                 return Signal(
                     type="B3",
@@ -310,7 +310,7 @@ def _derive_b3(
     if sequence is None:
         return None
     pullback, confirm = sequence
-    if pullback.low <= zhongshu.zg:
+    if pullback.low <= zhongshu.zg or confirm.low <= zhongshu.zg:
         return None
 
     available_time = max(confirm.available_time, center_confirmed_at)
@@ -347,7 +347,7 @@ def _derive_s3(
         )
         if sequence is not None:
             pullback_bi, confirm_bi = sequence
-            if pullback_bi.high < zhongshu.zd:
+            if pullback_bi.high < zhongshu.zd and confirm_bi.high < zhongshu.zd:
                 available_time = max(confirm_bi.available_time, center_confirmed_at)
                 return Signal(
                     type="S3",
@@ -371,7 +371,7 @@ def _derive_s3(
     if sequence is None:
         return None
     pullback, confirm = sequence
-    if pullback.high >= zhongshu.zd:
+    if pullback.high >= zhongshu.zd or confirm.high >= zhongshu.zd:
         return None
 
     available_time = max(confirm.available_time, center_confirmed_at)

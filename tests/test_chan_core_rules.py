@@ -543,6 +543,70 @@ class ChanCoreRulesTest(unittest.TestCase):
 
         self.assertNotIn("B3", {item.type for item in signals})
 
+    def test_b3_bi_context_requires_confirmation_to_stay_above_center(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[],
+            bis_sub=[],
+            segments_sub=[],
+            zhongshu_main=zs,
+            market_state=MarketState(trend_type="up"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+            bis_context=[
+                self._mk_bi(3, "up", 100.0, 108.0),
+                self._mk_bi(4, "down", 107.0, 103.0),
+                self._mk_bi(5, "up", 101.0, 109.0),
+            ],
+        )
+
+        self.assertNotIn("B3", {item.type for item in signals})
+
+    def test_b3_segment_requires_confirmation_to_stay_above_center(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[],
+            bis_sub=[],
+            segments_sub=[
+                self._mk_segment(1, "down", 103.0, 99.0),
+                self._mk_segment(2, "up", 108.0, 100.0),
+                self._mk_segment(3, "down", 107.0, 103.0),
+                self._mk_segment(4, "up", 109.0, 101.0),
+            ],
+            zhongshu_main=zs,
+            market_state=MarketState(trend_type="up"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+        )
+
+        self.assertNotIn("B3", {item.type for item in signals})
+
     def test_b3_not_emitted_if_center_available_later_than_pullback(
         self,
     ) -> None:
@@ -3024,6 +3088,70 @@ class ChanCoreRulesTest(unittest.TestCase):
                 self._mk_bi(3, "down", 101.0, 96.0),
                 self._mk_bi(4, "up", 93.0, 97.0),
                 self._mk_bi(5, "down", 95.0, 90.0),
+            ],
+        )
+
+        self.assertNotIn("S3", {item.type for item in signals})
+
+    def test_s3_segment_requires_confirmation_to_stay_below_center(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[],
+            bis_sub=[],
+            segments_sub=[
+                self._mk_segment(1, "up", 103.0, 99.0),
+                self._mk_segment(2, "down", 101.0, 96.0),
+                self._mk_segment(3, "up", 97.0, 93.0),
+                self._mk_segment(4, "down", 99.0, 90.0),
+            ],
+            zhongshu_main=zs,
+            market_state=MarketState(trend_type="down"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+        )
+
+        self.assertNotIn("S3", {item.type for item in signals})
+
+    def test_s3_bi_context_requires_confirmation_to_stay_below_center(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[],
+            bis_sub=[],
+            segments_sub=[],
+            zhongshu_main=zs,
+            market_state=MarketState(trend_type="down"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+            bis_context=[
+                self._mk_bi(3, "down", 101.0, 96.0),
+                self._mk_bi(4, "up", 93.0, 97.0),
+                self._mk_bi(5, "down", 100.0, 95.0),
             ],
         )
 
