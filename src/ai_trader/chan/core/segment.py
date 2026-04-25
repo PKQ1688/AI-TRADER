@@ -182,18 +182,23 @@ def build_segments(
         return segments
 
     cursor = 0
+    first_unconfirmed_start: int | None = None
+    last_confirmed_end_idx: int | None = None
     while cursor + 2 < len(bis):
+        if segments and bis[cursor].direction == segments[-1].direction:
+            cursor += 1
+            continue
+
         if not _has_three_overlap(bis[cursor], bis[cursor + 1], bis[cursor + 2]):
-            if segments:
-                segments.append(_provisional_segment(bis[cursor:]))
-                break
             cursor += 1
             continue
 
         end_idx, _ = _find_segment_end(bis, cursor, require_case2_confirmation)
         if end_idx is None or end_idx <= cursor:
-            segments.append(_provisional_segment(bis[cursor:]))
-            break
+            if not segments and first_unconfirmed_start is None:
+                first_unconfirmed_start = cursor
+            cursor += 1
+            continue
 
         sl = bis[cursor : end_idx + 1]
         last = sl[-1]
@@ -211,6 +216,18 @@ def build_segments(
         )
         # Consecutive segments share the boundary bi; advancing past it can
         # incorrectly emit multiple same-direction segments.
+        last_confirmed_end_idx = end_idx
         cursor = end_idx
+
+    if not segments:
+        if first_unconfirmed_start is None:
+            return segments
+        return [_provisional_segment(bis[first_unconfirmed_start:])]
+
+    if (
+        last_confirmed_end_idx is not None
+        and last_confirmed_end_idx + 2 < len(bis)
+    ):
+        segments.append(_provisional_segment(bis[last_confirmed_end_idx:]))
 
     return segments

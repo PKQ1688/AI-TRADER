@@ -257,6 +257,31 @@ class ChanCoreRulesTest(unittest.TestCase):
             ],
         )
 
+    def test_segment_continues_scanning_after_bad_boundary(self) -> None:
+        bis = [
+            self._mk_bi(0, "up", 100, 110),
+            self._mk_bi(1, "down", 108, 102),
+            self._mk_bi(2, "up", 103, 115),
+            self._mk_bi(3, "down", 120, 114),
+            # The immediate boundary after the first segment cannot start
+            # a valid opposite segment, but later strokes can.
+            self._mk_bi(4, "up", 82, 90),
+            self._mk_bi(5, "down", 150, 130),
+            self._mk_bi(6, "up", 134, 148),
+            self._mk_bi(7, "down", 147, 130),
+            self._mk_bi(8, "up", 132, 136),
+            self._mk_bi(9, "down", 135, 120),
+            self._mk_bi(10, "up", 138, 146),
+        ]
+
+        segments = build_segments(bis, require_case2_confirmation=True)
+
+        confirmed = [item for item in segments if item.status == "confirmed"]
+        self.assertGreaterEqual(len(confirmed), 2)
+        self.assertEqual(confirmed[0].direction, "up")
+        self.assertEqual(confirmed[1].direction, "down")
+        self.assertEqual(confirmed[1].start_index, bis[5].start_index)
+
     def test_b2_requires_first_pullback_after_b1_to_hold(self) -> None:
         signals = generate_signals(
             divergence_candidates=[self._mk_divergence("B1", 2, 95.0)],
