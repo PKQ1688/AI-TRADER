@@ -375,6 +375,10 @@ class SignificanceReport:
         return asdict(self)
 
 
+DEFAULT_STRUCTURE_LOOKBACK_MAIN_BARS = 720
+DEFAULT_STRUCTURE_LOOKBACK_SUB_BARS = 2880
+
+
 @dataclass(slots=True)
 class BacktestConfig:
     exchange: str = "binance"
@@ -397,8 +401,10 @@ class BacktestConfig:
     allow_short_entries: bool = True
     benchmark: str = "time_matched_random"
     random_seed: int = 7
-    structure_lookback_main_bars: int = 0
-    structure_lookback_sub_bars: int = 0
+    # 0 means full-history structure rebuild; keep normal backtests bounded.
+    structure_lookback_main_bars: int = DEFAULT_STRUCTURE_LOOKBACK_MAIN_BARS
+    structure_lookback_sub_bars: int = DEFAULT_STRUCTURE_LOOKBACK_SUB_BARS
+    check_signal_repaint: bool = False
 
 
 @dataclass(slots=True)

@@ -22,11 +22,33 @@ export AI_TRADER_DATA_DIR=/absolute/path/to/cache
 
 时间约定：本地 CSV 与交易所接口的 K 线 `time` 是开盘时间；`load_ohlcv` 返回给缠论、回放和回测的 `Bar.time` 统一平移为收盘后可用时间。因此所有 `start`/`end`/`asof` 参数都按“已收完可使用”的时间理解，避免把未完成 K 线提前纳入结构判断。
 
+回测默认只用最近 `720` 根主级别 K 线和 `2880` 根次级别 K 线构造缠论结构，避免每根 bar 都重建全历史状态。需要复现实验性全历史结构时，可把 `BacktestConfig.structure_lookback_main_bars` 和 `structure_lookback_sub_bars` 设为 `0`，但会显著变慢。
+
+回测内的逐 bar 重绘一致性检查默认关闭，避免每根 bar 额外重算上一根结构。需要在报告里启用该检查时，运行脚本加 `--repaint-check`。
+
 ### 运行
 
 ```bash
 uv sync
 uv run python scripts/run_btc_4h_backtest.py
+```
+
+默认只运行 base 场景。需要额外跑两档交易成本压力时：
+
+```bash
+uv run python scripts/run_btc_4h_backtest.py --cost-scenarios
+```
+
+需要额外跑 9 组参数敏感性时：
+
+```bash
+uv run python scripts/run_btc_4h_backtest.py --sensitivity
+```
+
+需要同时启用重绘一致性检查时：
+
+```bash
+uv run python scripts/run_btc_4h_backtest.py --repaint-check
 ```
 
 输出目录示例：

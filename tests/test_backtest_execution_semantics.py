@@ -10,6 +10,8 @@ from ai_trader.types import (
     Action,
     BacktestConfig,
     DataQuality,
+    DEFAULT_STRUCTURE_LOOKBACK_MAIN_BARS,
+    DEFAULT_STRUCTURE_LOOKBACK_SUB_BARS,
     MarketState,
     Risk,
     Signal,
@@ -130,6 +132,53 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
         self.assertTrue(input_lengths)
         self.assertLessEqual(max(item[0] for item in input_lengths), 25)
         self.assertLessEqual(max(item[1] for item in input_lengths), 80)
+        self.assertEqual(report.metrics["trade_count"], 0.0)
+
+    def test_default_structure_lookback_is_bounded(self) -> None:
+        bars_main = make_synthetic_bars(
+            start=datetime(2022, 1, 1, tzinfo=timezone.utc),
+            count=DEFAULT_STRUCTURE_LOOKBACK_MAIN_BARS + 80,
+            step_hours=4,
+        )
+        bars_sub = make_synthetic_bars(
+            start=datetime(2022, 1, 1, tzinfo=timezone.utc),
+            count=DEFAULT_STRUCTURE_LOOKBACK_SUB_BARS + 320,
+            step_hours=1,
+        )
+        input_lengths = []
+
+        def fake_build_chan_state(*args, **kwargs):
+            input_lengths.append((len(kwargs["bars_main"]), len(kwargs["bars_sub"])))
+            return self._snapshot(kwargs["asof_time"])
+
+        def fake_generate_signal(snapshot, **kwargs):
+            return _decision(snapshot.asof_time, "hold", [])
+
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
+        ):
+            report = run_backtest(
+                config=BacktestConfig(),
+                bars_main=bars_main,
+                bars_sub=bars_sub,
+            )
+
+        self.assertTrue(input_lengths)
+        self.assertLessEqual(
+            max(item[0] for item in input_lengths),
+            DEFAULT_STRUCTURE_LOOKBACK_MAIN_BARS,
+        )
+        self.assertLessEqual(
+            max(item[1] for item in input_lengths),
+            DEFAULT_STRUCTURE_LOOKBACK_SUB_BARS,
+        )
         self.assertEqual(report.metrics["trade_count"], 0.0)
 
     def test_blocked_buy_candidates_do_not_count_as_effective_samples(self) -> None:

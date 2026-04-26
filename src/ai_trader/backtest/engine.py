@@ -285,7 +285,7 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
         decision_signature = _decision_signature(decision_dict)
         signal_signatures[now_key] = _decision_signature(raw_decision_dict)
 
-        if i > 120:
+        if config.check_signal_repaint and i > 120:
             prev_time = bars_main[i - 1].time
             prev_key = iso_utc(prev_time)
             prev_sub_cursor = _sub_cursor_at_or_before(bars_sub, sub_cursor, prev_time)
