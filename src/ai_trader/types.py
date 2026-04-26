@@ -397,6 +397,8 @@ class BacktestConfig:
     allow_short_entries: bool = True
     benchmark: str = "time_matched_random"
     random_seed: int = 7
+    structure_lookback_main_bars: int = 0
+    structure_lookback_sub_bars: int = 0
 
 
 @dataclass(slots=True)

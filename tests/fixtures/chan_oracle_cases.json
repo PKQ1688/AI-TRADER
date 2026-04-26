@@ -275,10 +275,10 @@
     }
   },
   {
-    "id": "lesson53_first_class_preferred_when_b1_and_b2_coexist",
+    "id": "orthodox_execution_prefers_confirmed_b2_when_b1_and_b2_coexist",
     "lesson": 53,
     "source_url": "https://kline8.com/chanlun?p=53",
-    "rule": "同级别有一买时一买最佳，二买只是补充。",
+    "rule": "执行层按保守确认口径处理：一买保留为结构候选，二买确认后才触发买入动作。",
     "runner": "decide_action",
     "input": {
       "chan_mode": "orthodox_chan",
@@ -307,7 +307,7 @@
     },
     "expected": {
       "decision": "buy",
-      "reason_contains": "第一类买点（B1）"
+      "reason_contains": "保守确认买点"
     }
   },
   {

@@ -79,7 +79,7 @@ def _replay_row(snapshot, payload: dict, asof_close: float) -> dict:
         "zhongshu_count": payload["market_state"]["zhongshu_count"],
         "current_stroke_dir": payload["market_state"]["current_stroke_dir"],
         "current_segment_dir": payload["market_state"]["current_segment_dir"],
-        "raw_prev_main_time": (
+        "previous_main_available_time": (
             iso_utc(snapshot.previous_main_bar_time)
             if snapshot.previous_main_bar_time is not None
             else ""

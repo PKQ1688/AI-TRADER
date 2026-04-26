@@ -101,10 +101,11 @@ def _rule_b3(
     fallback: Zhongshu | None,
 ) -> tuple[bool, str]:
     zs = _resolve_anchor_center(signal, zhongshus, fallback)
-    if zs is None or last_bi is None:
-        return False, "missing anchor_center/last_bi"
-    ok = last_bi.direction == "up" and last_close > zs.zg
-    return ok, f"last_bi_dir={last_bi.direction}, close={last_close:.2f}, anchor_zg={zs.zg:.2f}"
+    if zs is None:
+        return False, "missing anchor_center"
+    del last_bi
+    ok = last_close > zs.zg
+    return ok, f"close={last_close:.2f}, anchor_zg={zs.zg:.2f}"
 
 
 def _rule_s3(
@@ -115,10 +116,11 @@ def _rule_s3(
     fallback: Zhongshu | None,
 ) -> tuple[bool, str]:
     zs = _resolve_anchor_center(signal, zhongshus, fallback)
-    if zs is None or last_bi is None:
-        return False, "missing anchor_center/last_bi"
-    ok = last_bi.direction == "down" and last_close < zs.zd
-    return ok, f"last_bi_dir={last_bi.direction}, close={last_close:.2f}, anchor_zd={zs.zd:.2f}"
+    if zs is None:
+        return False, "missing anchor_center"
+    del last_bi
+    ok = last_close < zs.zd
+    return ok, f"close={last_close:.2f}, anchor_zd={zs.zd:.2f}"
 
 
 def _rule_b2(

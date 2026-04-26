@@ -4,6 +4,7 @@ import unittest
 import unittest.mock
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from ai_trader.chan.core.center import build_zhongshus, build_zhongshus_from_bis
 from ai_trader.chan.core.buy_sell_points import decide_action, generate_signals
@@ -18,7 +19,13 @@ from ai_trader.chan.core.segment import build_segments
 from ai_trader.chan.core.stroke import build_bis
 from ai_trader.chan.core.trend_phase import infer_market_state
 from ai_trader.chan.core.trend_phase import infer_trend_type
-from ai_trader.chan.engine import _fresh_signals, _sub_interval_confirmed, build_chan_state, generate_signal, suppress_seen_signal_events
+from ai_trader.chan.engine import (
+    _fresh_signals,
+    _sub_interval_confirmed,
+    build_chan_state,
+    generate_signal,
+    suppress_seen_signal_events,
+)
 from ai_trader.types import (
     Action,
     Bar,
@@ -177,7 +184,9 @@ class ChanCoreRulesTest(unittest.TestCase):
             self.assertNotEqual(segments[i - 1].direction, segments[i].direction)
             self.assertEqual(segments[i - 1].end_index - 1, segments[i].start_index)
 
-    def test_segment_keeps_opposite_provisional_when_boundary_lacks_overlap(self) -> None:
+    def test_segment_keeps_opposite_provisional_when_boundary_lacks_overlap(
+        self,
+    ) -> None:
         bis = [
             Bi(
                 direction="up",
@@ -824,6 +833,104 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertNotIn("B3", {item.type for item in decision.signals})
         self.assertEqual(decision.action.decision, "hold")
 
+    def test_generate_signal_drops_b3_invalidated_before_asof(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+        market_state = MarketState(
+            trend_type="up",
+            walk_type="trend",
+            phase="trending",
+            zhongshu_count=1,
+            last_zhongshu={"zd": 98.0, "zg": 102.0, "gg": 110.0, "dd": 92.0},
+            current_stroke_dir="up",
+            current_segment_dir="up",
+        )
+        sub_bis = [
+            Bi(
+                direction="up",
+                start_index=3,
+                end_index=4,
+                start_price=100.0,
+                end_price=108.0,
+                event_time=self._t(3),
+                available_time=self._t(3),
+            ),
+            Bi(
+                direction="down",
+                start_index=4,
+                end_index=5,
+                start_price=108.0,
+                end_price=103.0,
+                event_time=self._t(4),
+                available_time=self._t(4),
+            ),
+            Bi(
+                direction="up",
+                start_index=5,
+                end_index=6,
+                start_price=103.0,
+                end_price=110.0,
+                event_time=self._t(5),
+                available_time=self._t(5),
+            ),
+        ]
+
+        snapshot = ChanSnapshot(
+            exchange="binance",
+            symbol="BTC/USDT",
+            timeframe_main="4h",
+            timeframe_sub="1h",
+            asof_time=self._t(6),
+            bars_main=[
+                Bar(time=self._t(4), open=103, high=108, low=103, close=107),
+                Bar(time=self._t(6), open=107, high=108, low=101, close=101),
+            ],
+            bars_sub=[
+                Bar(time=self._t(5), open=104, high=110, low=103, close=109),
+                Bar(time=self._t(6), open=109, high=109, low=101, close=101),
+            ],
+            macd_main=[MACDPoint(time=self._t(6), dif=0.0, dea=0.0, hist=1.0)],
+            macd_sub=[MACDPoint(time=self._t(6), dif=0.0, dea=0.0, hist=1.0)],
+            fractals_main=[],
+            fractals_sub=[],
+            bis_main=[
+                Bi(
+                    direction="up",
+                    start_index=3,
+                    end_index=5,
+                    start_price=100.0,
+                    end_price=110.0,
+                    event_time=self._t(5),
+                    available_time=self._t(5),
+                )
+            ],
+            bis_sub=sub_bis,
+            segments_main=[],
+            segments_sub=[],
+            previous_main_bar_time=self._t(4),
+            zhongshus_main=[zs],
+            zhongshus_sub=[],
+            last_zhongshu_main=zs,
+            trend_type_main="up",
+            market_state_main=market_state,
+            data_quality=DataQuality(status="ok", notes=""),
+        )
+
+        decision = generate_signal(snapshot)
+
+        self.assertNotIn("B3", {item.type for item in decision.signals})
+        self.assertEqual(decision.action.decision, "hold")
+
     def test_b3_not_emitted_if_pullback_precedes_origin_center_confirmation(
         self,
     ) -> None:
@@ -1366,7 +1473,9 @@ class ChanCoreRulesTest(unittest.TestCase):
 
         self.assertEqual(divergence, [])
 
-    def test_consolidation_divergence_detects_non_executable_hint_inside_single_center(self) -> None:
+    def test_consolidation_divergence_detects_non_executable_hint_inside_single_center(
+        self,
+    ) -> None:
         zs = Zhongshu(
             zd=98.0,
             zg=102.0,
@@ -1636,12 +1745,18 @@ class ChanCoreRulesTest(unittest.TestCase):
             asof_time=self._t(9),
         )
 
-        with unittest.mock.patch("ai_trader.chan.engine.build_zhongshus_from_bis", return_value=[zs, zs]), unittest.mock.patch(
-            "ai_trader.chan.engine.infer_market_state",
-            return_value=MarketState(trend_type="down", zhongshu_count=2),
-        ), unittest.mock.patch(
-            "ai_trader.chan.engine.detect_divergence_candidates",
-            return_value=[],
+        with (
+            unittest.mock.patch(
+                "ai_trader.chan.engine.build_zhongshus_from_bis", return_value=[zs, zs]
+            ),
+            unittest.mock.patch(
+                "ai_trader.chan.engine.infer_market_state",
+                return_value=MarketState(trend_type="down", zhongshu_count=2),
+            ),
+            unittest.mock.patch(
+                "ai_trader.chan.engine.detect_divergence_candidates",
+                return_value=[],
+            ),
         ):
             filtered = _sub_interval_confirmed(
                 snapshot,
@@ -1683,15 +1798,19 @@ class ChanCoreRulesTest(unittest.TestCase):
             asof_time=self._t(11),
         )
 
-        with unittest.mock.patch(
-            "ai_trader.chan.engine.build_zhongshus_from_bis",
-            return_value=[zs],
-        ), unittest.mock.patch(
-            "ai_trader.chan.engine.infer_market_state",
-            return_value=MarketState(trend_type="down", zhongshu_count=1),
-        ), unittest.mock.patch(
-            "ai_trader.chan.engine.detect_divergence_candidates",
-            return_value=[sub_b1],
+        with (
+            unittest.mock.patch(
+                "ai_trader.chan.engine.build_zhongshus_from_bis",
+                return_value=[zs],
+            ),
+            unittest.mock.patch(
+                "ai_trader.chan.engine.infer_market_state",
+                return_value=MarketState(trend_type="down", zhongshu_count=1),
+            ),
+            unittest.mock.patch(
+                "ai_trader.chan.engine.detect_divergence_candidates",
+                return_value=[sub_b1],
+            ),
         ):
             filtered = _sub_interval_confirmed(
                 snapshot,
@@ -1753,15 +1872,19 @@ class ChanCoreRulesTest(unittest.TestCase):
             asof_time=self._t(11),
         )
 
-        with unittest.mock.patch(
-            "ai_trader.chan.engine.build_zhongshus_from_bis",
-            return_value=[sub_zs],
-        ), unittest.mock.patch(
-            "ai_trader.chan.engine.infer_market_state",
-            return_value=MarketState(trend_type="down", zhongshu_count=1),
-        ), unittest.mock.patch(
-            "ai_trader.chan.engine.detect_divergence_candidates",
-            return_value=[sub_b1],
+        with (
+            unittest.mock.patch(
+                "ai_trader.chan.engine.build_zhongshus_from_bis",
+                return_value=[sub_zs],
+            ),
+            unittest.mock.patch(
+                "ai_trader.chan.engine.infer_market_state",
+                return_value=MarketState(trend_type="down", zhongshu_count=1),
+            ),
+            unittest.mock.patch(
+                "ai_trader.chan.engine.detect_divergence_candidates",
+                return_value=[sub_b1],
+            ),
         ):
             filtered = _sub_interval_confirmed(
                 snapshot,
@@ -1793,7 +1916,9 @@ class ChanCoreRulesTest(unittest.TestCase):
 
         self.assertEqual(signals, [])
 
-    def test_generate_signal_in_pragmatic_mode_keeps_consolidation_note_off_signal_list(self) -> None:
+    def test_generate_signal_in_pragmatic_mode_keeps_consolidation_note_off_signal_list(
+        self,
+    ) -> None:
         zs = Zhongshu(
             zd=98.0,
             zg=102.0,
@@ -1909,15 +2034,19 @@ class ChanCoreRulesTest(unittest.TestCase):
             asof_time=self._t(9),
         )
 
-        with unittest.mock.patch(
-            "ai_trader.chan.engine.build_zhongshus_from_bis",
-            return_value=[sub_zs],
-        ), unittest.mock.patch(
-            "ai_trader.chan.engine.infer_market_state",
-            return_value=MarketState(trend_type="up", zhongshu_count=1),
-        ), unittest.mock.patch(
-            "ai_trader.chan.engine.detect_divergence_candidates",
-            return_value=[],
+        with (
+            unittest.mock.patch(
+                "ai_trader.chan.engine.build_zhongshus_from_bis",
+                return_value=[sub_zs],
+            ),
+            unittest.mock.patch(
+                "ai_trader.chan.engine.infer_market_state",
+                return_value=MarketState(trend_type="up", zhongshu_count=1),
+            ),
+            unittest.mock.patch(
+                "ai_trader.chan.engine.detect_divergence_candidates",
+                return_value=[],
+            ),
         ):
             filtered = _sub_interval_confirmed(
                 snapshot,
@@ -1968,24 +2097,31 @@ class ChanCoreRulesTest(unittest.TestCase):
             zhongshu_count=1,
         )
 
-        with unittest.mock.patch(
-            "ai_trader.chan.engine.merge_inclusions",
-            side_effect=[bars_main, bars_sub],
-        ), unittest.mock.patch(
-            "ai_trader.chan.engine.detect_fractals",
-            side_effect=[[], []],
-        ), unittest.mock.patch(
-            "ai_trader.chan.engine.build_bis",
-            side_effect=[main_bis, sub_bis],
-        ), unittest.mock.patch(
-            "ai_trader.chan.engine.build_segments",
-            side_effect=[[], []],
-        ), unittest.mock.patch(
-            "ai_trader.chan.engine.build_zhongshus_from_bis",
-            side_effect=[[main_zs], [sub_zs]],
-        ) as mock_build_zhongshus, unittest.mock.patch(
-            "ai_trader.chan.engine.infer_market_state",
-            return_value=market_state,
+        with (
+            unittest.mock.patch(
+                "ai_trader.chan.engine.merge_inclusions",
+                side_effect=[bars_main, bars_sub],
+            ),
+            unittest.mock.patch(
+                "ai_trader.chan.engine.detect_fractals",
+                side_effect=[[], []],
+            ),
+            unittest.mock.patch(
+                "ai_trader.chan.engine.build_bis",
+                side_effect=[main_bis, sub_bis],
+            ),
+            unittest.mock.patch(
+                "ai_trader.chan.engine.build_segments",
+                side_effect=[[], []],
+            ),
+            unittest.mock.patch(
+                "ai_trader.chan.engine.build_zhongshus_from_bis",
+                side_effect=[[main_zs], [sub_zs]],
+            ) as mock_build_zhongshus,
+            unittest.mock.patch(
+                "ai_trader.chan.engine.infer_market_state",
+                return_value=market_state,
+            ),
         ):
             snapshot = build_chan_state(
                 bars_main=bars_main,
@@ -2227,7 +2363,9 @@ class ChanCoreRulesTest(unittest.TestCase):
 
         self.assertEqual(infer_trend_type(110.0, bis, zs), "range")
 
-    def test_trend_type_keeps_latest_completed_trend_when_later_center_overlaps(self) -> None:
+    def test_trend_type_keeps_latest_completed_trend_when_later_center_overlaps(
+        self,
+    ) -> None:
         zhongshus = [
             Zhongshu(
                 zd=95.0,
@@ -2317,7 +2455,7 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertIn("Zn", action.reason)
         self.assertIn("中枢扩展", summary)
 
-    def test_transitional_allows_b1_buy_when_reversing_downtrend(self) -> None:
+    def test_transitional_downgrades_b1_to_wait_when_reversing_downtrend(self) -> None:
         action, summary = decide_action(
             signals=[
                 Signal(
@@ -2353,11 +2491,11 @@ class ChanCoreRulesTest(unittest.TestCase):
             chan_config=get_chan_config("orthodox_chan"),
         )
 
-        self.assertEqual(action.decision, "buy")
-        self.assertIn("B1", action.reason)
-        self.assertIn("一类买点", summary)
+        self.assertEqual(action.decision, "wait")
+        self.assertIn("中阴阶段", action.reason)
+        self.assertIn("中枢扩展", summary)
 
-    def test_transitional_allows_s1_sell_when_reversing_uptrend(self) -> None:
+    def test_transitional_downgrades_s1_to_wait_when_reversing_uptrend(self) -> None:
         action, summary = decide_action(
             signals=[
                 Signal(
@@ -2393,11 +2531,11 @@ class ChanCoreRulesTest(unittest.TestCase):
             chan_config=get_chan_config("orthodox_chan"),
         )
 
-        self.assertEqual(action.decision, "sell")
-        self.assertIn("S1", action.reason)
-        self.assertIn("一类卖点", summary)
+        self.assertEqual(action.decision, "wait")
+        self.assertIn("中阴阶段", action.reason)
+        self.assertIn("中枢扩展", summary)
 
-    def test_transitional_allows_b2_buy_when_reversing_downtrend(self) -> None:
+    def test_transitional_downgrades_b2_to_wait_when_reversing_downtrend(self) -> None:
         action, summary = decide_action(
             signals=[
                 Signal(
@@ -2433,10 +2571,61 @@ class ChanCoreRulesTest(unittest.TestCase):
             chan_config=get_chan_config("orthodox_chan"),
         )
 
-        self.assertEqual(action.decision, "buy")
-        self.assertIn("保守确认买点", summary)
+        self.assertEqual(action.decision, "wait")
+        self.assertIn("中阴阶段", action.reason)
+        self.assertIn("中枢扩展", summary)
 
-    def test_generate_signal_in_strict_mode_skips_consolidation_b1_candidate(self) -> None:
+    def test_transitional_downgrades_b3_to_wait(self) -> None:
+        action, summary = decide_action(
+            signals=[
+                Signal(
+                    type="B3",
+                    level="main",
+                    trigger="B3 trigger",
+                    invalid_if="B3 invalid",
+                    confidence=0.68,
+                    event_time=self._t(8),
+                    available_time=self._t(8),
+                    invalid_price=95.0,
+                )
+            ],
+            market_state=MarketState(trend_type="up", phase="transitional"),
+            conflict_level="none",
+            min_confidence=0.60,
+            chan_config=get_chan_config("orthodox_chan"),
+        )
+
+        self.assertEqual(action.decision, "wait")
+        self.assertIn("三类点", action.reason)
+        self.assertIn("降级观察", summary)
+
+    def test_transitional_uses_s3_as_reduce_only(self) -> None:
+        action, summary = decide_action(
+            signals=[
+                Signal(
+                    type="S3",
+                    level="main",
+                    trigger="S3 trigger",
+                    invalid_if="S3 invalid",
+                    confidence=0.68,
+                    event_time=self._t(8),
+                    available_time=self._t(8),
+                    invalid_price=105.0,
+                )
+            ],
+            market_state=MarketState(trend_type="down", phase="transitional"),
+            conflict_level="none",
+            min_confidence=0.60,
+            chan_config=get_chan_config("orthodox_chan"),
+        )
+
+        self.assertEqual(action.decision, "reduce")
+        self.assertIn("仅用于降风险", action.reason)
+        self.assertIn("不作为反手", summary)
+
+    def test_generate_signal_in_strict_mode_skips_consolidation_b1_candidate(
+        self,
+    ) -> None:
         zs = Zhongshu(
             zd=98.0,
             zg=102.0,
@@ -2505,7 +2694,9 @@ class ChanCoreRulesTest(unittest.TestCase):
             data_quality=DataQuality(status="ok", notes=""),
         )
 
-        decision = generate_signal(snapshot, chan_config=get_chan_config("strict_kline8"))
+        decision = generate_signal(
+            snapshot, chan_config=get_chan_config("strict_kline8")
+        )
 
         signal_types = {item.type for item in decision.signals}
         self.assertNotIn("B1", signal_types)
@@ -2513,7 +2704,7 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertEqual(decision.action.decision, "hold")
         self.assertEqual(decision.cn_summary, "暂无明确执行信号，以观察为主。")
 
-    def test_orthodox_mode_prefers_b1_over_b2_when_enabled(self) -> None:
+    def test_orthodox_mode_ignores_b1_for_execution_when_b2_exists(self) -> None:
         action, summary = decide_action(
             signals=[
                 Signal(
@@ -2535,17 +2726,40 @@ class ChanCoreRulesTest(unittest.TestCase):
                     available_time=self._t(8),
                 ),
             ],
-            market_state=MarketState(trend_type="down", phase="consolidating"),
+            market_state=MarketState(trend_type="down", phase="trending"),
             conflict_level="low",
             min_confidence=0.60,
             chan_config=get_chan_config("orthodox_chan"),
         )
 
         self.assertEqual(action.decision, "buy")
-        self.assertIn("B1", action.reason)
-        self.assertIn("一类买点", summary)
+        self.assertIn("B2/B3", action.reason)
+        self.assertIn("保守确认买点", summary)
 
-    def test_orthodox_mode_allows_b2_buy_under_high_conflict_when_reversing_downtrend(self) -> None:
+    def test_orthodox_mode_waits_on_b2_when_phase_not_trending(self) -> None:
+        action, summary = decide_action(
+            signals=[
+                Signal(
+                    type="B2",
+                    level="sub",
+                    trigger="B2 trigger",
+                    invalid_if="B2 invalid",
+                    confidence=0.95,
+                    event_time=self._t(8),
+                    available_time=self._t(8),
+                )
+            ],
+            market_state=MarketState(trend_type="down", phase="consolidating"),
+            conflict_level="none",
+            min_confidence=0.60,
+            chan_config=get_chan_config("orthodox_chan"),
+        )
+
+        self.assertEqual(action.decision, "wait")
+        self.assertIn("阶段未确认", action.reason)
+        self.assertIn("等待趋势状态明确", summary)
+
+    def test_orthodox_mode_blocks_b2_buy_under_high_conflict(self) -> None:
         action, summary = decide_action(
             signals=[
                 Signal(
@@ -2565,10 +2779,11 @@ class ChanCoreRulesTest(unittest.TestCase):
             chan_config=get_chan_config("orthodox_chan"),
         )
 
-        self.assertEqual(action.decision, "buy")
-        self.assertIn("买点", summary)
+        self.assertEqual(action.decision, "wait")
+        self.assertIn("主次级别冲突高", action.reason)
+        self.assertIn("等待结构统一", summary)
 
-    def test_orthodox_mode_allows_s1_sell_under_high_conflict_when_reversing_uptrend(self) -> None:
+    def test_orthodox_mode_blocks_s1_sell_under_high_conflict(self) -> None:
         action, summary = decide_action(
             signals=[
                 Signal(
@@ -2588,10 +2803,11 @@ class ChanCoreRulesTest(unittest.TestCase):
             chan_config=get_chan_config("orthodox_chan"),
         )
 
-        self.assertEqual(action.decision, "sell")
-        self.assertIn("卖点", summary)
+        self.assertEqual(action.decision, "wait")
+        self.assertIn("主次级别冲突高", action.reason)
+        self.assertIn("等待结构统一", summary)
 
-    def test_orthodox_mode_allows_b3_buy_under_high_conflict(self) -> None:
+    def test_orthodox_mode_blocks_b3_buy_under_high_conflict(self) -> None:
         action, summary = decide_action(
             signals=[
                 Signal(
@@ -2611,10 +2827,11 @@ class ChanCoreRulesTest(unittest.TestCase):
             chan_config=get_chan_config("orthodox_chan"),
         )
 
-        self.assertEqual(action.decision, "buy")
-        self.assertIn("保守确认买点", summary)
+        self.assertEqual(action.decision, "wait")
+        self.assertIn("主次级别冲突高", action.reason)
+        self.assertIn("等待结构统一", summary)
 
-    def test_orthodox_mode_allows_s3_sell_under_high_conflict(self) -> None:
+    def test_orthodox_mode_uses_s3_as_reduce_under_high_conflict(self) -> None:
         action, summary = decide_action(
             signals=[
                 Signal(
@@ -2634,8 +2851,9 @@ class ChanCoreRulesTest(unittest.TestCase):
             chan_config=get_chan_config("orthodox_chan"),
         )
 
-        self.assertEqual(action.decision, "sell")
-        self.assertIn("强卖出条件", action.reason)
+        self.assertEqual(action.decision, "reduce")
+        self.assertIn("仅用于降风险", action.reason)
+        self.assertIn("优先减仓", summary)
 
     def test_orthodox_mode_keeps_b1_candidate_without_sub_confirmation(self) -> None:
         main_candidate = self._mk_divergence("B1", 8, 90.0)
@@ -2905,7 +3123,94 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertEqual(decision.risk.conflict_level, "high")
         self.assertEqual(decision.action.decision, "wait")
 
-    def test_conflict_high_with_s3_signal_executes_sell(self) -> None:
+    def test_generate_signal_uses_sub_bis_for_main_third_class_confirmation(
+        self,
+    ) -> None:
+        main_bis = [
+            Bi(
+                direction="up",
+                start_index=0,
+                end_index=1,
+                start_price=98.0,
+                end_price=108.0,
+                event_time=self._t(1),
+                available_time=self._t(1),
+            )
+        ]
+        sub_bis = [
+            Bi(
+                direction="up",
+                start_index=0,
+                end_index=1,
+                start_price=99.0,
+                end_price=103.0,
+                event_time=self._t(1),
+                available_time=self._t(1),
+            )
+        ]
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+        snapshot = ChanSnapshot(
+            exchange="binance",
+            symbol="BTC/USDT",
+            timeframe_main="4h",
+            timeframe_sub="1h",
+            asof_time=self._t(3),
+            bars_main=[
+                Bar(time=self._t(2), open=100, high=103, low=99, close=101),
+                Bar(time=self._t(3), open=101, high=104, low=100, close=103),
+            ],
+            bars_sub=[
+                Bar(time=self._t(2), open=100, high=103, low=99, close=101),
+                Bar(time=self._t(3), open=101, high=104, low=100, close=103),
+            ],
+            macd_main=[MACDPoint(time=self._t(3), dif=0.0, dea=0.0, hist=1.0)],
+            macd_sub=[MACDPoint(time=self._t(3), dif=0.0, dea=0.0, hist=1.0)],
+            fractals_main=[],
+            fractals_sub=[],
+            bis_main=main_bis,
+            bis_sub=sub_bis,
+            segments_main=[],
+            segments_sub=[],
+            previous_main_bar_time=self._t(2),
+            zhongshus_main=[zs],
+            zhongshus_sub=[],
+            last_zhongshu_main=zs,
+            trend_type_main="up",
+            market_state_main=MarketState(
+                trend_type="up",
+                walk_type="trend",
+                phase="trending",
+                zhongshu_count=1,
+                last_zhongshu={"zd": 98.0, "zg": 102.0, "gg": 110.0, "dd": 92.0},
+                current_stroke_dir="up",
+                current_segment_dir="up",
+            ),
+            data_quality=DataQuality(status="ok", notes=""),
+        )
+
+        with (
+            patch(
+                "ai_trader.chan.engine.detect_divergence_candidates",
+                return_value=[],
+            ),
+            patch("ai_trader.chan.engine.generate_signals", return_value=[]) as mocked,
+        ):
+            generate_signal(snapshot, chan_config=get_chan_config("orthodox_chan"))
+
+        self.assertIs(mocked.call_args.kwargs["bis_context"], sub_bis)
+
+    def test_conflict_high_with_s3_signal_reduces_risk(self) -> None:
         bars_main = [
             Bar(time=self._t(0), open=108, high=110, low=102, close=104),
             Bar(time=self._t(1), open=104, high=105, low=95, close=96),
@@ -3011,7 +3316,7 @@ class ChanCoreRulesTest(unittest.TestCase):
         signal_types = {item.type for item in decision.signals}
         self.assertIn("S3", signal_types)
         self.assertEqual(decision.risk.conflict_level, "high")
-        self.assertEqual(decision.action.decision, "sell")
+        self.assertEqual(decision.action.decision, "reduce")
 
     def test_s3_uses_first_pullback_not_later_one(self) -> None:
         zs = Zhongshu(

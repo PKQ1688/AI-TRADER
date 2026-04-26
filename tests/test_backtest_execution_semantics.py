@@ -6,7 +6,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ai_trader.backtest.engine import run_backtest
-from ai_trader.types import Action, BacktestConfig, DataQuality, MarketState, Risk, Signal, SignalDecision
+from ai_trader.types import (
+    Action,
+    BacktestConfig,
+    DataQuality,
+    MarketState,
+    Risk,
+    Signal,
+    SignalDecision,
+)
 from tests.test_utils import make_synthetic_bars
 
 
@@ -34,10 +42,14 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
     def _snapshot(self, asof_time, center_start_index: int | None = None):
         zhongshu = None
         if center_start_index is not None:
-            zhongshu = SimpleNamespace(start_index=center_start_index, available_time=asof_time)
+            zhongshu = SimpleNamespace(
+                start_index=center_start_index, available_time=asof_time
+            )
         return SimpleNamespace(asof_time=asof_time, last_zhongshu_main=zhongshu)
 
-    def test_backtest_prefetches_history_but_starts_evaluation_at_config_start(self) -> None:
+    def test_backtest_prefetches_history_but_starts_evaluation_at_config_start(
+        self,
+    ) -> None:
         load_calls = []
         asof_times = []
 
@@ -55,10 +67,19 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
         def fake_generate_signal(snapshot, **kwargs):
             return _decision(snapshot.asof_time, "hold", [])
 
-        with patch("ai_trader.backtest.engine.load_ohlcv", side_effect=fake_load_ohlcv), patch(
-            "ai_trader.backtest.engine.compute_macd", side_effect=fake_compute_macd
-        ), patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
-            "ai_trader.backtest.engine.generate_signal", side_effect=fake_generate_signal
+        with (
+            patch("ai_trader.backtest.engine.load_ohlcv", side_effect=fake_load_ohlcv),
+            patch(
+                "ai_trader.backtest.engine.compute_macd", side_effect=fake_compute_macd
+            ),
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
         ):
             report = run_backtest(
                 config=BacktestConfig(
@@ -77,6 +98,79 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
         self.assertGreaterEqual(report.signals[0]["time"], "2022-02-10T00:00:00Z")
         self.assertEqual(report.metrics["trade_count"], 0.0)
 
+    def test_structure_lookback_limits_chan_state_inputs(self) -> None:
+        input_lengths = []
+
+        def fake_build_chan_state(*args, **kwargs):
+            input_lengths.append((len(kwargs["bars_main"]), len(kwargs["bars_sub"])))
+            return self._snapshot(kwargs["asof_time"])
+
+        def fake_generate_signal(snapshot, **kwargs):
+            return _decision(snapshot.asof_time, "hold", [])
+
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
+        ):
+            report = run_backtest(
+                config=BacktestConfig(
+                    structure_lookback_main_bars=25,
+                    structure_lookback_sub_bars=80,
+                ),
+                bars_main=self.bars_main,
+                bars_sub=self.bars_sub,
+            )
+
+        self.assertTrue(input_lengths)
+        self.assertLessEqual(max(item[0] for item in input_lengths), 25)
+        self.assertLessEqual(max(item[1] for item in input_lengths), 80)
+        self.assertEqual(report.metrics["trade_count"], 0.0)
+
+    def test_blocked_buy_candidates_do_not_count_as_effective_samples(self) -> None:
+        def fake_build_chan_state(*args, **kwargs):
+            return self._snapshot(kwargs["asof_time"])
+
+        def fake_generate_signal(snapshot, **kwargs):
+            signal = Signal(
+                type="B3",
+                level="main",
+                trigger="b3",
+                invalid_if="invalid",
+                confidence=0.70,
+                event_time=snapshot.asof_time,
+                available_time=snapshot.asof_time,
+                invalid_price=100.0,
+            )
+            return _decision(snapshot.asof_time, "wait", [signal])
+
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
+        ):
+            report = run_backtest(
+                config=BacktestConfig(
+                    chan_mode="orthodox_chan", allow_short_entries=False
+                ),
+                bars_main=self.bars_main,
+                bars_sub=self.bars_sub,
+            )
+
+        self.assertEqual(report.metrics["trade_count"], 0.0)
+        self.assertFalse(report.pass_checks["sample_count_ge_80"])
+        self.assertIn("有效B2/B3样本不足80", report.fail_reasons)
+
     def test_strict_reduce_signal_does_not_open_short(self) -> None:
         def fake_build_chan_state(*args, **kwargs):
             return self._snapshot(kwargs["asof_time"])
@@ -94,9 +188,15 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
             )
             return _decision(snapshot.asof_time, "reduce", [s3])
 
-        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
-            "ai_trader.backtest.engine.generate_signal",
-            side_effect=fake_generate_signal,
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
         ):
             report = run_backtest(
                 config=BacktestConfig(chan_mode="strict_kline8"),
@@ -157,9 +257,15 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
 
             return _decision(snapshot.asof_time, "hold", [])
 
-        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
-            "ai_trader.backtest.engine.generate_signal",
-            side_effect=fake_generate_signal,
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
         ):
             report = run_backtest(
                 config=BacktestConfig(chan_mode="strict_kline8"),
@@ -208,9 +314,15 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
 
             return _decision(snapshot.asof_time, "hold", [])
 
-        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
-            "ai_trader.backtest.engine.generate_signal",
-            side_effect=fake_generate_signal,
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
         ):
             report = run_backtest(
                 config=BacktestConfig(chan_mode="strict_kline8"),
@@ -256,12 +368,20 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
 
             return _decision(snapshot.asof_time, "hold", [])
 
-        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
-            "ai_trader.backtest.engine.generate_signal",
-            side_effect=fake_generate_signal,
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
         ):
             report = run_backtest(
-                config=BacktestConfig(chan_mode="strict_kline8", allow_short_entries=False),
+                config=BacktestConfig(
+                    chan_mode="strict_kline8", allow_short_entries=False
+                ),
                 bars_main=self.bars_main,
                 bars_sub=self.bars_sub,
             )
@@ -270,7 +390,7 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
         self.assertEqual(report.trades[0].side, "long")
         self.assertGreaterEqual(report.equity_curve[-1].cash, 0.0)
 
-    def test_high_conflict_b2_buy_can_open_long_for_reversal_entry(self) -> None:
+    def test_high_conflict_b2_buy_does_not_open_long_in_orthodox_mode(self) -> None:
         buy_time = self.bars_main[120].time
         sell_time = self.bars_main[121].time
 
@@ -328,22 +448,28 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
 
             return _decision(snapshot.asof_time, "hold", [])
 
-        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
-            "ai_trader.backtest.engine.generate_signal",
-            side_effect=fake_generate_signal,
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
         ):
             report = run_backtest(
-                config=BacktestConfig(chan_mode="orthodox_chan", allow_short_entries=False),
+                config=BacktestConfig(
+                    chan_mode="orthodox_chan", allow_short_entries=False
+                ),
                 bars_main=self.bars_main,
                 bars_sub=self.bars_sub,
             )
 
-        self.assertEqual(len(report.trades), 1)
-        self.assertEqual(report.trades[0].side, "long")
-        self.assertEqual(report.trades[0].entry_time, self.bars_main[121].time)
-        self.assertEqual(report.trades[0].exit_time, self.bars_main[122].time)
+        self.assertEqual(len(report.trades), 0)
+        self.assertEqual(report.metrics["trade_count"], 0.0)
 
-    def test_high_conflict_b3_buy_can_open_long_for_structural_entry(self) -> None:
+    def test_high_conflict_b3_buy_does_not_open_long_in_orthodox_mode(self) -> None:
         buy_time = self.bars_main[120].time
         sell_time = self.bars_main[121].time
 
@@ -403,20 +529,26 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
 
             return _decision(snapshot.asof_time, "hold", [])
 
-        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
-            "ai_trader.backtest.engine.generate_signal",
-            side_effect=fake_generate_signal,
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
         ):
             report = run_backtest(
-                config=BacktestConfig(chan_mode="orthodox_chan", allow_short_entries=False),
+                config=BacktestConfig(
+                    chan_mode="orthodox_chan", allow_short_entries=False
+                ),
                 bars_main=self.bars_main,
                 bars_sub=self.bars_sub,
             )
 
-        self.assertEqual(len(report.trades), 1)
-        self.assertEqual(report.trades[0].side, "long")
-        self.assertEqual(report.trades[0].entry_time, self.bars_main[121].time)
-        self.assertEqual(report.trades[0].exit_time, self.bars_main[122].time)
+        self.assertEqual(len(report.trades), 0)
+        self.assertEqual(report.metrics["trade_count"], 0.0)
 
     def test_fresh_reduce_signals_only_apply_once_per_position(self) -> None:
         buy_time = self.bars_main[120].time
@@ -454,9 +586,15 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
 
             return _decision(snapshot.asof_time, "hold", [])
 
-        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
-            "ai_trader.backtest.engine.generate_signal",
-            side_effect=fake_generate_signal,
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
         ):
             report = run_backtest(
                 config=BacktestConfig(chan_mode="strict_kline8"),
@@ -476,7 +614,12 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
 
         def fake_build_chan_state(*args, **kwargs):
             asof_time = kwargs["asof_time"]
-            if asof_time in {first_buy_time, first_sell_time, second_buy_time, second_sell_time}:
+            if asof_time in {
+                first_buy_time,
+                first_sell_time,
+                second_buy_time,
+                second_sell_time,
+            }:
                 return self._snapshot(asof_time, center_start_index=7)
             return self._snapshot(asof_time)
 
@@ -509,12 +652,20 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
 
             return _decision(snapshot.asof_time, "hold", [])
 
-        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
-            "ai_trader.backtest.engine.generate_signal",
-            side_effect=fake_generate_signal,
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
         ):
             report = run_backtest(
-                config=BacktestConfig(chan_mode="orthodox_chan", allow_short_entries=False),
+                config=BacktestConfig(
+                    chan_mode="orthodox_chan", allow_short_entries=False
+                ),
                 bars_main=self.bars_main,
                 bars_sub=self.bars_sub,
             )
@@ -523,7 +674,9 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
         self.assertEqual(report.trades[0].entry_time, self.bars_main[121].time)
         self.assertEqual(report.trades[0].exit_time, self.bars_main[122].time)
 
-    def test_different_main_centers_can_each_trigger_one_effective_b3_entry(self) -> None:
+    def test_different_main_centers_can_each_trigger_one_effective_b3_entry(
+        self,
+    ) -> None:
         first_buy_time = self.bars_main[120].time
         first_sell_time = self.bars_main[121].time
         second_buy_time = self.bars_main[122].time
@@ -566,12 +719,20 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
 
             return _decision(snapshot.asof_time, "hold", [])
 
-        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
-            "ai_trader.backtest.engine.generate_signal",
-            side_effect=fake_generate_signal,
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
         ):
             report = run_backtest(
-                config=BacktestConfig(chan_mode="orthodox_chan", allow_short_entries=False),
+                config=BacktestConfig(
+                    chan_mode="orthodox_chan", allow_short_entries=False
+                ),
                 bars_main=self.bars_main,
                 bars_sub=self.bars_sub,
             )
@@ -580,7 +741,9 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
         self.assertEqual(report.trades[0].entry_time, self.bars_main[121].time)
         self.assertEqual(report.trades[1].entry_time, self.bars_main[123].time)
 
-    def test_b3_execution_uses_signal_anchor_center_not_snapshot_last_center(self) -> None:
+    def test_b3_execution_uses_signal_anchor_center_not_snapshot_last_center(
+        self,
+    ) -> None:
         first_buy_time = self.bars_main[120].time
         first_sell_time = self.bars_main[121].time
         second_buy_time = self.bars_main[122].time
@@ -588,7 +751,12 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
 
         def fake_build_chan_state(*args, **kwargs):
             asof_time = kwargs["asof_time"]
-            if asof_time in {first_buy_time, first_sell_time, second_buy_time, second_sell_time}:
+            if asof_time in {
+                first_buy_time,
+                first_sell_time,
+                second_buy_time,
+                second_sell_time,
+            }:
                 return self._snapshot(asof_time, center_start_index=7)
             return self._snapshot(asof_time)
 
@@ -651,12 +819,20 @@ class BacktestExecutionSemanticsTest(unittest.TestCase):
 
             return _decision(snapshot.asof_time, "hold", [])
 
-        with patch("ai_trader.backtest.engine.build_chan_state", side_effect=fake_build_chan_state), patch(
-            "ai_trader.backtest.engine.generate_signal",
-            side_effect=fake_generate_signal,
+        with (
+            patch(
+                "ai_trader.backtest.engine.build_chan_state",
+                side_effect=fake_build_chan_state,
+            ),
+            patch(
+                "ai_trader.backtest.engine.generate_signal",
+                side_effect=fake_generate_signal,
+            ),
         ):
             report = run_backtest(
-                config=BacktestConfig(chan_mode="orthodox_chan", allow_short_entries=False),
+                config=BacktestConfig(
+                    chan_mode="orthodox_chan", allow_short_entries=False
+                ),
                 bars_main=self.bars_main,
                 bars_sub=self.bars_sub,
             )

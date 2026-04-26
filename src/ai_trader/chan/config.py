@@ -35,13 +35,9 @@ STRICT_KLINE8 = ChanConfig(
 )
 ORTHODOX_CHAN = ChanConfig(
     mode="orthodox_chan",
-    execution_buy_types=("B1", "B2", "B3"),
-    execution_reduce_types=("S1", "S2", "S3"),
-    execution_sell_types=("S1", "S2", "S3"),
-    execution_buy_min_confidence=0.60,
-    execution_reduce_min_confidence=0.60,
-    reduce_only_on_high_conflict=False,
-    prefer_first_class_signals=True,
+    execution_buy_types=("B2", "B3"),
+    execution_reduce_types=("S2", "S3"),
+    execution_sell_types=(),
     require_sub_interval_confirmation=False,
     include_consolidation_divergence_hint=False,
 )

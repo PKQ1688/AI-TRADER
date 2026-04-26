@@ -11,7 +11,9 @@ def _clamp01(v: float) -> float:
     return max(0.0, min(1.0, v))
 
 
-def _apply_phase_cap(signal_type: str, confidence: float, phase: str, cap: float) -> float:
+def _apply_phase_cap(
+    signal_type: str, confidence: float, phase: str, cap: float
+) -> float:
     if phase != "transitional":
         return confidence
     if signal_type in {"B3", "S3"}:
@@ -19,15 +21,11 @@ def _apply_phase_cap(signal_type: str, confidence: float, phase: str, cap: float
     return min(confidence, cap)
 
 
-def allow_high_conflict_reversal(signal: Signal | None, market_state: MarketState) -> bool:
-    if signal is None:
-        return False
-    if signal.type in {"B3", "S3"}:
-        return True
-    if signal.type in {"B1", "B2"} and market_state.trend_type == "down":
-        return True
-    if signal.type in {"S1", "S2"} and market_state.trend_type == "up":
-        return True
+def allow_high_conflict_reversal(
+    signal: Signal | None, market_state: MarketState
+) -> bool:
+    """Conservative execution never opens through high level conflict."""
+    del signal, market_state
     return False
 
 
@@ -448,15 +446,21 @@ def generate_signals(
         conf = signal.confidence
         if macd_missing:
             conf -= missing_macd_penalty
-        conf = _apply_phase_cap(signal.type, conf, market_state.phase, transitional_confidence_cap)
+        conf = _apply_phase_cap(
+            signal.type, conf, market_state.phase, transitional_confidence_cap
+        )
         signal.confidence = _clamp01(conf)
 
     signals.sort(key=lambda x: x.confidence, reverse=True)
     return signals
 
 
-def _best_signal(signals: Iterable[Signal], kinds: set[str], min_confidence: float) -> Signal | None:
-    candidates = [x for x in signals if x.type in kinds and x.confidence >= min_confidence]
+def _best_signal(
+    signals: Iterable[Signal], kinds: set[str], min_confidence: float
+) -> Signal | None:
+    candidates = [
+        x for x in signals if x.type in kinds and x.confidence >= min_confidence
+    ]
     if not candidates:
         return None
     candidates.sort(key=lambda x: x.confidence, reverse=True)
@@ -512,40 +516,61 @@ def decide_action(
 
     allow_high_conflict_buy = allow_high_conflict_reversal(best_buy, market_state)
     allow_high_conflict_sell = allow_high_conflict_reversal(best_sell, market_state)
-    transitional_reversal_buy = (
-        best_buy is not None
-        and best_buy.type in {"B1", "B2"}
-        and market_state.trend_type == "down"
-    )
-    transitional_reversal_sell = (
-        best_sell is not None
-        and best_sell.type in {"S1", "S2"}
-        and market_state.trend_type == "up"
-    )
 
     if market_state.phase == "transitional":
-        if (
-            best_b3 is None
-            and best_s3 is None
-            and not transitional_reversal_buy
-            and not transitional_reversal_sell
-        ):
+        if best_reduce is not None:
+            return (
+                Action(decision="reduce", reason="中阴阶段卖点仅用于降风险"),
+                "处于中阴阶段，卖点只用于降低风险，不作为反手开仓依据。",
+            )
+        if best_b3 is not None or best_s3 is not None:
+            return (
+                Action(decision="wait", reason="中阴阶段三类点先观察确认"),
+                "处于中阴阶段，三类买卖点先降级观察，等待新走势类型确认。",
+            )
+        if best_b3 is None and best_s3 is None:
             if oscillation_breakout in {"above_zg", "below_zd"} and first_breakout:
                 return (
-                    Action(decision="wait", reason="中阴阶段内Zn首次越界，先区分三买卖与中枢扩展"),
+                    Action(
+                        decision="wait",
+                        reason="中阴阶段内Zn首次越界，先区分三买卖与中枢扩展",
+                    ),
                     "处于中阴阶段，Zn 已首次越界，需先区分第三类买卖点还是中枢扩展。",
                 )
             if limit_reached:
                 return (
-                    Action(decision="wait", reason="中枢震荡段数已超过9，等待级别升级后的新结构"),
+                    Action(
+                        decision="wait",
+                        reason="中枢震荡段数已超过9，等待级别升级后的新结构",
+                    ),
                     "当前中枢震荡已超过 9 段，优先等待次级别升级后的新结构确认。",
                 )
-            return Action(decision="wait", reason="中阴阶段默认等待新走势类型确认"), "处于中阴阶段，等待第三类买卖点确认后再操作。"
+            return Action(
+                decision="wait", reason="中阴阶段默认等待新走势类型确认"
+            ), "处于中阴阶段，等待第三类买卖点确认后再操作。"
 
-    if conflict_level == "high" and not allow_high_conflict_buy and not allow_high_conflict_sell:
+    if (
+        conflict_level == "high"
+        and chan_config.require_non_high_conflict_buy
+        and not allow_high_conflict_buy
+        and not allow_high_conflict_sell
+    ):
         if best_reduce is not None:
-            return Action(decision="reduce", reason="主次级别冲突高，卖点仅用于降风险"), "主次级别冲突高，优先减仓而非激进反手。"
-        return Action(decision="wait", reason="主次级别冲突高，放弃方向性动作"), "主次级别冲突高，等待结构统一后再执行。"
+            return Action(
+                decision="reduce", reason="主次级别冲突高，卖点仅用于降风险"
+            ), "主次级别冲突高，优先减仓而非激进反手。"
+        return Action(
+            decision="wait", reason="主次级别冲突高，放弃方向性动作"
+        ), "主次级别冲突高，等待结构统一后再执行。"
+
+    if (
+        best_buy is not None
+        and chan_config.require_non_high_conflict_buy
+        and market_state.phase != "trending"
+    ):
+        return Action(
+            decision="wait", reason="买点出现但走势阶段未确认"
+        ), "买点候选已出现，但当前走势阶段未确认，等待趋势状态明确后再执行。"
 
     if (
         best_buy is not None
@@ -557,23 +582,39 @@ def decide_action(
         and (best_reduce is None or best_buy.confidence >= best_reduce.confidence)
     ):
         if best_buy.type == "B1":
-            return Action(decision="buy", reason="出现第一类买点（B1）"), "当前出现一类买点，可按结构与风控执行。"
-        return Action(decision="buy", reason="出现保守确认买点（B2/B3）"), "当前出现保守确认买点，可按风控分批参与。"
+            return Action(
+                decision="buy", reason="出现第一类买点（B1）"
+            ), "当前出现一类买点，可按结构与风控执行。"
+        return Action(
+            decision="buy", reason="出现保守确认买点（B2/B3）"
+        ), "当前出现保守确认买点，可按风控分批参与。"
 
     if best_sell is not None:
         if best_sell.type == "S1":
-            return Action(decision="sell", reason="出现第一类卖点（S1）"), "当前出现一类卖点，优先按结构退出或反手。"
-        return Action(decision="sell", reason="执行过滤后出现强卖出条件"), "出现强卖出条件，优先平仓控制风险。"
+            return Action(
+                decision="sell", reason="出现第一类卖点（S1）"
+            ), "当前出现一类卖点，优先按结构退出或反手。"
+        return Action(
+            decision="sell", reason="执行过滤后出现强卖出条件"
+        ), "出现强卖出条件，优先平仓控制风险。"
 
     if best_reduce is not None:
         if chan_config.reduce_only_on_high_conflict and conflict_level != "high":
-            return Action(decision="hold", reason="减仓信号存在但冲突不高，按过滤规则继续持有"), "减仓信号已出现，但未达到高冲突条件，继续观察。"
-        return Action(decision="reduce", reason="执行过滤后出现减仓信号"), "出现减仓信号，建议先降风险再观察主级别。"
+            return Action(
+                decision="hold", reason="减仓信号存在但冲突不高，按过滤规则继续持有"
+            ), "减仓信号已出现，但未达到高冲突条件，继续观察。"
+        return Action(
+            decision="reduce", reason="执行过滤后出现减仓信号"
+        ), "出现减仓信号，建议先降风险再观察主级别。"
 
     if has_turning_only:
-        return Action(decision="hold", reason="仅出现一类买卖点候选，等待确认"), "当前仅为候选转折，维持观察或轻仓持有。"
+        return Action(
+            decision="hold", reason="仅出现一类买卖点候选，等待确认"
+        ), "当前仅为候选转折，维持观察或轻仓持有。"
 
-    return Action(decision="hold", reason="未出现有效二三类买卖点"), "暂无明确执行信号，以观察为主。"
+    return Action(
+        decision="hold", reason="未出现有效二三类买卖点"
+    ), "暂无明确执行信号，以观察为主。"
 
 
 def build_risk(conflict_level: str, note: str) -> Risk:

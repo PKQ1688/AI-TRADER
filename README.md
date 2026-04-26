@@ -20,6 +20,8 @@ uv run python scripts/warm_cache.py \
 export AI_TRADER_DATA_DIR=/absolute/path/to/cache
 ```
 
+时间约定：本地 CSV 与交易所接口的 K 线 `time` 是开盘时间；`load_ohlcv` 返回给缠论、回放和回测的 `Bar.time` 统一平移为收盘后可用时间。因此所有 `start`/`end`/`asof` 参数都按“已收完可使用”的时间理解，避免把未完成 K 线提前纳入结构判断。
+
 ### 运行
 
 ```bash
@@ -71,10 +73,11 @@ uv run python -m unittest discover -s tests -p "test_*.py"
 信号会完整输出，但动作层默认执行保守过滤：
 
 - 买入：使用 `B2/B3`，且 `confidence >= 0.65`
+- 买入阶段约束：仅在 `phase=trending` 时执行；盘整/中阴阶段先等待
 - 买入冲突约束：`conflict_level` 不能为 `high`
-- 中阴阶段：默认 `wait`；仅出现明确三类点（`B3/S3`）才允许突破默认等待
+- 中阴阶段：默认 `wait`；`B3/S3` 先降级为观察或减仓，不直接开仓/反手
 - 减仓：使用 `S2/S3`，且默认只在 `conflict_level=high` 时触发
-- `orthodox_chan` 现在是默认正统模式；`strict_kline8` 仍保留更保守的确认和高冲突过滤，不直接把减仓信号当作开空信号
+- `orthodox_chan` 现在是默认正统模式；`strict_kline8` 仍保留更严格的确认，不直接把减仓信号当作开空信号
 
 ## 结构诊断（真实 BTC 行情）
 

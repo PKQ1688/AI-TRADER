@@ -86,6 +86,18 @@ def _signal_center_key(signal: Signal | None, snapshot) -> tuple[str, int] | Non
     return None
 
 
+def _lookback_start(end_exclusive: int, limit: int) -> int:
+    if limit <= 0:
+        return 0
+    return max(0, end_exclusive - limit)
+
+
+def _sub_cursor_at_or_before(bars_sub: list[Bar], cursor: int, asof_time) -> int:
+    while cursor > 0 and bars_sub[cursor - 1].time > asof_time:
+        cursor -= 1
+    return cursor
+
+
 def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bars_sub: list[Bar] | None = None) -> BacktestReport:
     chan_config = get_chan_config(config.chan_mode)
     buy_entry_types = set(chan_config.execution_buy_types)
@@ -207,8 +219,12 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
         while sub_cursor < len(bars_sub) and bars_sub[sub_cursor].time <= bar.time:
             sub_cursor += 1
 
-        prefix_main = bars_main[: i + 1]
-        prefix_sub = bars_sub[:sub_cursor]
+        main_start = _lookback_start(i + 1, config.structure_lookback_main_bars)
+        sub_start = _lookback_start(sub_cursor, config.structure_lookback_sub_bars)
+        prefix_main = bars_main[main_start : i + 1]
+        prefix_sub = bars_sub[sub_start:sub_cursor]
+        prefix_macd_main = macd_main_full[main_start : i + 1]
+        prefix_macd_sub = macd_sub_full[sub_start:sub_cursor]
 
         # 当前bar收盘权益
         position_value = position_qty * bar.close
@@ -229,8 +245,8 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
         snapshot = build_chan_state(
             bars_main=prefix_main,
             bars_sub=prefix_sub,
-            macd_main=macd_main_full,
-            macd_sub=macd_sub_full,
+            macd_main=prefix_macd_main,
+            macd_sub=prefix_macd_sub,
             asof_time=bar.time,
             exchange=config.exchange,
             symbol=config.symbol,
@@ -272,11 +288,16 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
         if i > 120:
             prev_time = bars_main[i - 1].time
             prev_key = iso_utc(prev_time)
+            prev_sub_cursor = _sub_cursor_at_or_before(bars_sub, sub_cursor, prev_time)
+            prev_main_start = _lookback_start(i, config.structure_lookback_main_bars)
+            prev_sub_start = _lookback_start(prev_sub_cursor, config.structure_lookback_sub_bars)
+            prev_prefix_main = bars_main[prev_main_start:i]
+            prev_prefix_sub = bars_sub[prev_sub_start:prev_sub_cursor]
             prev_snapshot = build_chan_state(
-                bars_main=prefix_main,
-                bars_sub=prefix_sub,
-                macd_main=macd_main_full,
-                macd_sub=macd_sub_full,
+                bars_main=prev_prefix_main,
+                bars_sub=prev_prefix_sub,
+                macd_main=macd_main_full[prev_main_start:i],
+                macd_sub=macd_sub_full[prev_sub_start:prev_sub_cursor],
                 asof_time=prev_time,
                 exchange=config.exchange,
                 symbol=config.symbol,
@@ -295,11 +316,41 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
                 if _decision_signature(prev_decision) != signal_signatures[prev_key]:
                     repaint_count += 1
 
+        buy_signal = _top_signal(
+            decision.signals,
+            buy_entry_types,
+            buy_entry_min_conf,
+            preferred_types=buy_signal_priority,
+        )
+        reduce_signal = _top_signal(
+            decision.signals,
+            set(chan_config.execution_reduce_types),
+            max(config.min_confidence, chan_config.execution_reduce_min_confidence),
+            preferred_types=sell_signal_priority,
+        )
+        sell_signal = _top_signal(
+            decision.signals,
+            sell_entry_types,
+            sell_entry_min_conf,
+            preferred_types=sell_signal_priority,
+        )
+        buy_center_key = _signal_center_key(buy_signal, snapshot)
+        sell_center_key = _signal_center_key(sell_signal, snapshot)
+
         # 冻结恢复双通道
         if frozen:
-            has_effective_buy = any(
-                item.type in buy_entry_types and item.confidence >= config.min_confidence
-                for item in decision.signals
+            has_effective_buy = (
+                decision.action.decision == "buy"
+                and buy_signal is not None
+                and (
+                    buy_center_key is None
+                    or buy_center_key not in consumed_buy_center_keys
+                )
+                and (
+                    decision.risk.conflict_level != "high"
+                    or allow_high_conflict_reversal(buy_signal, decision.market_state)
+                )
+                and decision.data_quality.status == "ok"
             )
             newer_zhongshu = (
                 snapshot.last_zhongshu_main is not None
@@ -327,27 +378,6 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
             size_multiplier = 0.0
         if recovery_positive_needed > 0:
             size_multiplier = min(size_multiplier, 0.5)
-
-        buy_signal = _top_signal(
-            decision.signals,
-            buy_entry_types,
-            buy_entry_min_conf,
-            preferred_types=buy_signal_priority,
-        )
-        reduce_signal = _top_signal(
-            decision.signals,
-            set(chan_config.execution_reduce_types),
-            max(config.min_confidence, chan_config.execution_reduce_min_confidence),
-            preferred_types=sell_signal_priority,
-        )
-        sell_signal = _top_signal(
-            decision.signals,
-            sell_entry_types,
-            sell_entry_min_conf,
-            preferred_types=sell_signal_priority,
-        )
-        buy_center_key = _signal_center_key(buy_signal, snapshot)
-        sell_center_key = _signal_center_key(sell_signal, snapshot)
 
         # 先处理平仓/减仓（t信号，t+1开盘执行）
         should_close = False
@@ -538,8 +568,13 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
     sample_count = sum(
         1
         for record in decisions_out
-        for item in record["signals"]
-        if item["type"] in buy_entry_types and float(item["confidence"]) >= config.min_confidence
+        if record["data_quality"]["status"] == "ok"
+        and record["action"]["decision"] == "buy"
+        and any(
+            item["type"] in buy_entry_types
+            and float(item["confidence"]) >= buy_entry_min_conf
+            for item in record["signals"]
+        )
     )
 
     buy_forward = [item.forward_3bar_return for item in trades if item.signal_type in buy_entry_types]
@@ -559,7 +594,7 @@ def run_backtest(config: BacktestConfig, bars_main: list[Bar] | None = None, bar
         reason
         for key, reason in {
             "sample_count_ge_80": f"有效{buy_label}样本不足80",
-            "b23_expectation_gt_0": f"{buy_label}三根4h前瞻收益期望未大于0",
+            "b23_expectation_gt_0": f"{buy_label}三根主级别前瞻收益期望未大于0",
             "p_value_lt_0_05": "相对时间匹配随机基线未达到统计显著(p>=0.05)",
             "max_drawdown_le_0_25": "最大回撤超过25%",
             "signal_repaint_rate_eq_0": "检测到信号重绘",

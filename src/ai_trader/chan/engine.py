@@ -352,6 +352,40 @@ def _fresh_signals(snapshot: ChanSnapshot, signals):
     ]
 
 
+def _invalidated_after_available(
+    signal: Signal,
+    bars: list[Bar],
+    asof_time,
+) -> bool:
+    if signal.invalid_price is None:
+        return False
+
+    for bar in bars:
+        if bar.time <= signal.available_time or bar.time > asof_time:
+            continue
+        if signal.type.startswith("B") and bar.low <= signal.invalid_price:
+            return True
+        if signal.type.startswith("S") and bar.high >= signal.invalid_price:
+            return True
+
+    return False
+
+
+def _drop_invalidated_fresh_signals(
+    snapshot: ChanSnapshot,
+    signals: list[Signal],
+) -> list[Signal]:
+    if not signals:
+        return []
+
+    bars = snapshot.bars_sub if snapshot.bars_sub else snapshot.bars_main
+    return [
+        item
+        for item in signals
+        if not _invalidated_after_available(item, bars, snapshot.asof_time)
+    ]
+
+
 def _sub_interval_confirmed(
     snapshot: ChanSnapshot,
     main_candidates,
@@ -523,10 +557,11 @@ def generate_signal(
         macd_missing=macd_missing,
         missing_macd_penalty=cfg.missing_macd_penalty,
         transitional_confidence_cap=cfg.transitional_confidence_cap,
-        bis_context=snapshot.bis_main,
+        bis_context=snapshot.bis_sub,
     )
 
     fresh_signals = _fresh_signals(snapshot, signals)
+    fresh_signals = _drop_invalidated_fresh_signals(snapshot, fresh_signals)
 
     conflict_level, conflict_note = _conflict_level(snapshot)
     oscillation_note = _oscillation_note(market_state)

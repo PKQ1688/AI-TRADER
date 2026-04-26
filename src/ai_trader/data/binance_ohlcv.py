@@ -4,10 +4,12 @@ import csv
 import os
 import time
 import warnings
+from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from typing import Iterable
 
-from ai_trader.types import Bar, parse_utc_time
+from ai_trader.types import Bar, iso_utc, parse_utc_time
 
 
 def _timeframe_to_ms(timeframe: str) -> int:
@@ -20,6 +22,10 @@ def _timeframe_to_ms(timeframe: str) -> int:
     if unit == "d":
         return value * 24 * 60 * 60 * 1000
     raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+
+def timeframe_to_timedelta(timeframe: str) -> timedelta:
+    return timedelta(milliseconds=_timeframe_to_ms(timeframe))
 
 
 def _data_root() -> Path:
@@ -78,6 +84,18 @@ def _merge_bars(left: list[Bar], right: list[Bar]) -> list[Bar]:
     for item in right:
         merged[int(item.time.timestamp())] = item
     return [merged[k] for k in sorted(merged.keys())]
+
+
+def _to_available_time(bars: Iterable[Bar], timeframe: str) -> list[Bar]:
+    delta = timeframe_to_timedelta(timeframe)
+    return [replace(item, time=item.time + delta) for item in bars]
+
+
+def _filter_available_window(
+    bars: Iterable[Bar], start, end, timeframe: str
+) -> list[Bar]:
+    delta = timeframe_to_timedelta(timeframe)
+    return [item for item in bars if start <= item.time + delta <= end]
 
 
 def _bars_from_ohlcv_rows(rows: Iterable[Iterable[float]], start_ms: int, end_ms: int) -> list[Bar]:
@@ -230,16 +248,25 @@ def _fetch_range_with_retry(exchange: str, symbol: str, timeframe: str, start_ms
 
 
 def load_ohlcv(exchange: str, symbol: str, timeframe: str, start_utc: str, end_utc: str) -> list[Bar]:
-    """Load OHLCV with cache-first strategy and incremental missing-range refill."""
+    """Load closed OHLCV bars with cache-first refill.
+
+    Exchange/cache timestamps are open times. Returned ``Bar.time`` values
+    are close/availability times, so downstream Chan logic can treat
+    ``bar.time <= asof_time`` as "this bar was already known".
+    """
     start = parse_utc_time(start_utc)
     end = parse_utc_time(end_utc)
     if end < start:
         raise ValueError("end_utc must be >= start_utc")
 
+    step_ms = _timeframe_to_ms(timeframe)
+    raw_start = iso_utc(start - timedelta(milliseconds=step_ms))
+    raw_end = iso_utc(end - timedelta(milliseconds=step_ms))
+
     path = _cache_path(exchange=exchange, symbol=symbol, timeframe=timeframe)
     cached = _read_csv(path)
 
-    missing = _find_missing_ranges(cached, start_utc=start_utc, end_utc=end_utc, timeframe=timeframe)
+    missing = _find_missing_ranges(cached, start_utc=raw_start, end_utc=raw_end, timeframe=timeframe)
     allowed = int(os.getenv("AI_TRADER_MAX_MISSING_BARS", "3"))
     missing_bars = _count_missing_bars(missing, timeframe=timeframe) if missing else 0
 
@@ -250,7 +277,10 @@ def load_ohlcv(exchange: str, symbol: str, timeframe: str, start_utc: str, end_u
             f"missing_bars={missing_bars}, missing={summary}",
             stacklevel=2,
         )
-        return [item for item in cached if start <= item.time <= end]
+        return _to_available_time(
+            _filter_available_window(cached, start, end, timeframe),
+            timeframe,
+        )
 
     if missing:
         merged = cached[:]
@@ -269,7 +299,7 @@ def load_ohlcv(exchange: str, symbol: str, timeframe: str, start_utc: str, end_u
         _write_csv(path, merged)
         cached = merged
 
-        remaining = _find_missing_ranges(cached, start_utc=start_utc, end_utc=end_utc, timeframe=timeframe)
+        remaining = _find_missing_ranges(cached, start_utc=raw_start, end_utc=raw_end, timeframe=timeframe)
         if remaining:
             missing_bars = _count_missing_bars(remaining, timeframe=timeframe)
             summary = ", ".join(f"[{_from_ms(a)} ~ {_from_ms(b)}]" for a, b in remaining[:5])
@@ -284,4 +314,7 @@ def load_ohlcv(exchange: str, symbol: str, timeframe: str, start_utc: str, end_u
                 stacklevel=2,
             )
 
-    return [item for item in cached if start <= item.time <= end]
+    return _to_available_time(
+        _filter_available_window(cached, start, end, timeframe),
+        timeframe,
+    )

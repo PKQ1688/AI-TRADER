@@ -4,7 +4,7 @@ import csv
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ai_trader.data import cache_path_for, load_ohlcv
@@ -38,28 +38,34 @@ class CacheLoaderTest(unittest.TestCase):
         start = datetime(2025, 1, 1, tzinfo=timezone.utc)
         bars = make_synthetic_bars(start=start, count=20, step_hours=4)
         self._write_cache("unknown_exchange", "BTC/USDT", "4h", bars)
+        query_start = bars[0].time + timedelta(hours=4)
+        query_end = bars[-1].time + timedelta(hours=4)
 
         result = load_ohlcv(
             exchange="unknown_exchange",
             symbol="BTC/USDT",
             timeframe="4h",
-            start_utc=bars[0].time.isoformat().replace("+00:00", "Z"),
-            end_utc=bars[-1].time.isoformat().replace("+00:00", "Z"),
+            start_utc=query_start.isoformat().replace("+00:00", "Z"),
+            end_utc=query_end.isoformat().replace("+00:00", "Z"),
         )
         self.assertEqual(len(result), len(bars))
+        self.assertEqual(result[0].time, query_start)
+        self.assertEqual(result[-1].time, query_end)
 
     def test_incomplete_cache_triggers_fetch_and_fails_for_unknown_exchange(self) -> None:
         start = datetime(2025, 1, 1, tzinfo=timezone.utc)
         bars = make_synthetic_bars(start=start, count=20, step_hours=4)
         self._write_cache("unknown_exchange", "BTC/USDT", "4h", bars[:10])
+        query_start = bars[0].time + timedelta(hours=4)
+        query_end = bars[-1].time + timedelta(hours=4)
 
         with self.assertRaises(ValueError):
             load_ohlcv(
                 exchange="unknown_exchange",
                 symbol="BTC/USDT",
                 timeframe="4h",
-                start_utc=bars[0].time.isoformat().replace("+00:00", "Z"),
-                end_utc=bars[-1].time.isoformat().replace("+00:00", "Z"),
+                start_utc=query_start.isoformat().replace("+00:00", "Z"),
+                end_utc=query_end.isoformat().replace("+00:00", "Z"),
             )
 
 
