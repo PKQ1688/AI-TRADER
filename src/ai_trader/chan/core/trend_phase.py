@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ai_trader.types import Bi, MarketState, Segment, TrendType, Zhongshu
+from ai_trader.types import Bi, ChanLevel, MarketState, Segment, TrendType, Zhongshu
 
 
 def _segment_overlaps_center(segment: Segment, zhongshu: Zhongshu) -> bool:
@@ -118,6 +118,7 @@ def infer_market_state(
     bis: list[Bi],
     segments: list[Segment],
     zhongshus: list[Zhongshu],
+    structure_levels: list[ChanLevel] | None = None,
 ) -> MarketState:
     trend_pair = find_latest_trend_center_pair(zhongshus)
     trend_type = trend_pair[0] if trend_pair is not None else "range"
@@ -176,6 +177,9 @@ def infer_market_state(
     current_stroke_dir = bis[-1].direction if bis else "up"
     current_segment_dir = segments[-1].direction if segments else current_stroke_dir
 
+    current_walk = _current_walk_payload(structure_levels)
+    level_states = _level_state_payloads(structure_levels)
+
     return MarketState(
         trend_type=trend_type,
         walk_type=walk_type,
@@ -184,5 +188,76 @@ def infer_market_state(
         last_zhongshu=last_zs_payload,
         current_stroke_dir=current_stroke_dir,
         current_segment_dir=current_segment_dir,
+        current_walk=current_walk,
+        level_states=level_states,
         oscillation_state=oscillation_state,
     )
+
+
+def _current_walk_payload(structure_levels: list[ChanLevel] | None) -> dict:
+    if not structure_levels:
+        return {
+            "id": None,
+            "level": 0,
+            "kind": "unknown",
+            "status": "provisional",
+            "missing_sub_walks": 3,
+            "possible_next": ["consolidation", "trend_up", "trend_down"],
+        }
+    for level in reversed(structure_levels):
+        if level.walks:
+            walk = level.walks[-1]
+            missing = 0 if walk.status == "confirmed" else 1
+            return {
+                "id": walk.id,
+                "level": walk.level,
+                "kind": walk.kind,
+                "status": walk.status,
+                "start_index": walk.start_index,
+                "end_index": walk.end_index,
+                "center_ids": list(walk.center_ids),
+                "missing_sub_walks": missing,
+                "possible_next": _possible_next(walk.kind),
+            }
+    first = structure_levels[0]
+    return {
+        "id": None,
+        "level": first.level,
+        "kind": "unknown",
+        "status": "provisional",
+        "missing_sub_walks": max(0, 3 - len(first.units)),
+        "possible_next": ["consolidation", "trend_up", "trend_down"],
+    }
+
+
+def _possible_next(kind: str) -> list[str]:
+    if kind == "trend_up":
+        return ["trend_up_extension", "consolidation", "trend_down_reversal"]
+    if kind == "trend_down":
+        return ["trend_down_extension", "consolidation", "trend_up_reversal"]
+    if kind == "consolidation":
+        return ["extension", "expansion", "trend_up", "trend_down"]
+    return ["consolidation", "trend_up", "trend_down"]
+
+
+def _level_state_payloads(structure_levels: list[ChanLevel] | None) -> list[dict]:
+    if not structure_levels:
+        return []
+    payloads: list[dict] = []
+    for level in structure_levels:
+        last_walk = level.walks[-1] if level.walks else None
+        last_center = level.centers[-1] if level.centers else None
+        payloads.append(
+            {
+                "level": level.level,
+                "timeframe": level.timeframe,
+                "unit_count": len(level.units),
+                "center_count": len(level.centers),
+                "walk_count": len(level.walks),
+                "last_walk_kind": last_walk.kind if last_walk else "unknown",
+                "last_walk_status": last_walk.status if last_walk else "provisional",
+                "last_center_evolution": last_center.evolution if last_center else "none",
+                "complete": bool(last_walk and last_walk.status == "confirmed"),
+            }
+        )
+    return payloads

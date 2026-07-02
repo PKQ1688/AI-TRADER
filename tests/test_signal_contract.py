@@ -32,6 +32,8 @@ class SignalContractTest(unittest.TestCase):
             "last_zhongshu",
             "current_stroke_dir",
             "current_segment_dir",
+            "current_walk",
+            "level_states",
             "oscillation_state",
         ]:
             self.assertIn(key, market_state)
@@ -71,6 +73,31 @@ class SignalContractTest(unittest.TestCase):
             self.assertLessEqual(sig["confidence"], 1.0)
             self.assertTrue(sig["trigger"])
             self.assertTrue(sig["invalid_if"])
+            for key in [
+                "event_time",
+                "available_time",
+                "invalid_price",
+                "source_level",
+                "source",
+                "anchor_center_id",
+                "structure_path",
+            ]:
+                self.assertIn(key, sig)
+
+        self.assertIn("divergences", payload)
+        self.assertIn("buy_sell_points", payload)
+        for item in payload["divergences"]:
+            for key in [
+                "mode",
+                "direction",
+                "level",
+                "confidence",
+                "weaken_ratio",
+                "event_time",
+                "available_time",
+                "outcome",
+            ]:
+                self.assertIn(key, item)
 
 
 if __name__ == "__main__":

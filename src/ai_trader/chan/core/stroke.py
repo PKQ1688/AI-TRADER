@@ -9,6 +9,22 @@ def _pick_extreme_same_kind(current: Fractal, incoming: Fractal) -> Fractal:
     return incoming if incoming.price < current.price else current
 
 
+def _extend_last_bi_endpoint_if_needed(
+    bis: list[Bi], current: Fractal, selected: Fractal
+) -> None:
+    if selected is current or not bis:
+        return
+
+    last = bis[-1]
+    if last.end_index != current.index:
+        return
+
+    last.end_index = selected.index
+    last.end_price = selected.price
+    last.event_time = selected.event_time
+    last.available_time = max(last.available_time, selected.available_time)
+
+
 def _valid_bi_pair(
     start: Fractal, end: Fractal, bars: list[Bar], min_bars: int
 ) -> bool:
@@ -51,7 +67,9 @@ def build_bis(fractals: list[Fractal], bars: list[Bar], min_bars: int = 5) -> li
 
     for fx in fractals[1:]:
         if fx.kind == start.kind:
-            start = _pick_extreme_same_kind(start, fx)
+            selected = _pick_extreme_same_kind(start, fx)
+            _extend_last_bi_endpoint_if_needed(bis, start, selected)
+            start = selected
             continue
 
         if _valid_bi_pair(start, fx, bars, min_bars):

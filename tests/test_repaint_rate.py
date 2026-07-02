@@ -14,7 +14,11 @@ class RepaintRateTest(unittest.TestCase):
         bars_main = make_synthetic_bars(start=start, count=260, step_hours=4)
         bars_sub = make_synthetic_bars(start=start, count=1040, step_hours=1)
 
-        report = run_backtest(config=BacktestConfig(), bars_main=bars_main, bars_sub=bars_sub)
+        report = run_backtest(
+            config=BacktestConfig(check_signal_repaint=True),
+            bars_main=bars_main,
+            bars_sub=bars_sub,
+        )
         self.assertEqual(report.signal_repaint_rate, 0.0)
 
 

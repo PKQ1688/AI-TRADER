@@ -3,7 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ai_trader.chan.core.center import classify_center_relation
-from ai_trader.types import Bi, MACDPoint, TrendType, Zhongshu
+from ai_trader.types import (
+    Bi,
+    ConsolidationOutcome,
+    DivergenceState,
+    MACDPoint,
+    SignalType,
+    TrendType,
+    Zhongshu,
+)
 
 
 @dataclass(slots=True)
@@ -19,6 +27,31 @@ class DivergenceCandidate:
     anchor_center_start_index: int | None = None
     anchor_center_end_index: int | None = None
     anchor_center_available_time: object | None = None
+    level: int = 0
+    direction: str = "down"
+    weaken_ratio: float = 0.0
+    anchor_center_id: str | None = None
+    outcome: ConsolidationOutcome = "unknown"
+
+    def to_state(self) -> DivergenceState:
+        return DivergenceState(
+            mode="trend" if self.mode == "trend" else "consolidation",
+            direction="down" if self.direction == "down" else "up",
+            signal_type=self.signal_type,  # type: ignore[arg-type]
+            level=self.level,
+            confidence=self.confidence,
+            weaken_ratio=self.weaken_ratio,
+            trigger=self.trigger,
+            invalid_if=self.invalid_if,
+            invalid_price=self.invalid_price,
+            event_time=self.event_time,
+            available_time=self.available_time,
+            anchor_center_id=self.anchor_center_id,
+            anchor_center_start_index=self.anchor_center_start_index,
+            anchor_center_end_index=self.anchor_center_end_index,
+            anchor_center_available_time=self.anchor_center_available_time,
+            outcome=self.outcome,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +91,9 @@ def _zero_axis_pullback(
     """
     points = [pt for pt in macd if start_time <= pt.time <= end_time]
     if not points:
-        # If there are no MACD points in the gap we cannot verify – be lenient
-        return True
+        # Orthodox Chan treats MACD as an auxiliary proof, not a fallback.
+        # Missing points mean the zero-axis pullback cannot be verified.
+        return False
 
     for pt in points:
         # Crossed zero or very close
@@ -251,6 +285,8 @@ def _build_candidate(
     cur_bi: Bi,
     weaken_ratio: float,
     anchor_center: Zhongshu,
+    level: int = 0,
+    outcome: ConsolidationOutcome = "unknown",
 ) -> DivergenceCandidate:
     if direction == "down":
         if mode == "trend":
@@ -287,7 +323,18 @@ def _build_candidate(
         anchor_center_end_index=anchor_center.end_index,
         anchor_center_available_time=anchor_center.origin_available_time
         or anchor_center.available_time,
+        level=level,
+        direction=direction,
+        weaken_ratio=weaken_ratio,
+        anchor_center_id=f"L{level}:zs:{anchor_center.start_index}-{anchor_center.end_index}",
+        outcome=outcome,
     )
+
+
+def _candidate_signal_type(candidate: DivergenceCandidate) -> SignalType | None:
+    if candidate.signal_type in {"B1", "B2", "B3", "S1", "S2", "S3"}:
+        return candidate.signal_type  # type: ignore[return-value]
+    return None
 
 
 def detect_divergence_candidates(
@@ -344,7 +391,8 @@ def detect_divergence_candidates(
                         macd, A_zs.available_time, B_zs.available_time
                     )
 
-                    if pullback_ok:
+                    c_completed = all(item.status == "confirmed" for item in c_window)
+                    if pullback_ok and c_completed:
                         a_area = _macd_area_directed(
                             macd, a_window[0].event_time, A_zs.available_time, direction
                         )
@@ -363,6 +411,7 @@ def detect_divergence_candidates(
                                         cur_bi,
                                         weaken,
                                         B_zs,
+                                        level=0,
                                     )
                                 )
                                 continue  # found trend divergence, skip fallback
@@ -401,7 +450,27 @@ def detect_divergence_candidates(
         if weaken_ratio < threshold:
             continue
 
+        outcome: ConsolidationOutcome
+        if direction == "up":
+            outcome = "third_class" if cur_bi.low > center.zg else "return_to_center"
+        else:
+            outcome = "third_class" if cur_bi.high < center.zd else "return_to_center"
+
         mode = "consolidation"
-        out.append(_build_candidate(direction, mode, cur_bi, weaken_ratio, center))
+        out.append(
+            _build_candidate(
+                direction,
+                mode,
+                cur_bi,
+                weaken_ratio,
+                center,
+                level=0,
+                outcome=outcome,
+            )
+        )
 
     return out
+
+
+def divergence_states(candidates: list[DivergenceCandidate]) -> list[DivergenceState]:
+    return [item.to_state() for item in candidates]

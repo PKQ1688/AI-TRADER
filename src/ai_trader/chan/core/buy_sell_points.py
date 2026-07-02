@@ -4,7 +4,17 @@ from typing import Iterable
 
 from ai_trader.chan.config import ChanConfig
 from ai_trader.chan.core.divergence import DivergenceCandidate
-from ai_trader.types import Action, Bi, MarketState, Risk, Segment, Signal, Zhongshu
+from ai_trader.types import (
+    Action,
+    Bi,
+    BuySellPoint,
+    DivergenceState,
+    MarketState,
+    Risk,
+    Segment,
+    Signal,
+    Zhongshu,
+)
 
 
 def _clamp01(v: float) -> float:
@@ -227,6 +237,11 @@ def _derive_b2(
         anchor_center_start_index=b1.anchor_center_start_index,
         anchor_center_end_index=b1.anchor_center_end_index,
         anchor_center_available_time=b1.anchor_center_available_time,
+        source_level=b1.source_level,
+        source="second_class",
+        anchor_center_id=b1.anchor_center_id,
+        divergence_mode=b1.divergence_mode,
+        structure_path=list(b1.structure_path) + ["B2"],
     )
 
 
@@ -263,6 +278,11 @@ def _derive_s2(
         anchor_center_start_index=s1.anchor_center_start_index,
         anchor_center_end_index=s1.anchor_center_end_index,
         anchor_center_available_time=s1.anchor_center_available_time,
+        source_level=s1.source_level,
+        source="second_class",
+        anchor_center_id=s1.anchor_center_id,
+        divergence_mode=s1.divergence_mode,
+        structure_path=list(s1.structure_path) + ["S2"],
     )
 
 
@@ -298,6 +318,14 @@ def _derive_b3(
                     anchor_center_start_index=zhongshu.start_index,
                     anchor_center_end_index=zhongshu.end_index,
                     anchor_center_available_time=center_confirmed_at,
+                    source_level=0,
+                    source="third_class",
+                    anchor_center_id=f"L0:zs:{zhongshu.start_index}-{zhongshu.end_index}",
+                    structure_path=[
+                        f"center:{zhongshu.start_index}-{zhongshu.end_index}",
+                        "departure:up",
+                        "first_pullback",
+                    ],
                 )
 
     sequence = _first_pullback_after_departure(
@@ -324,6 +352,14 @@ def _derive_b3(
         anchor_center_start_index=zhongshu.start_index,
         anchor_center_end_index=zhongshu.end_index,
         anchor_center_available_time=center_confirmed_at,
+        source_level=0,
+        source="third_class",
+        anchor_center_id=f"L0:zs:{zhongshu.start_index}-{zhongshu.end_index}",
+        structure_path=[
+            f"center:{zhongshu.start_index}-{zhongshu.end_index}",
+            "departure:up",
+            "first_pullback",
+        ],
     )
 
 
@@ -359,6 +395,14 @@ def _derive_s3(
                     anchor_center_start_index=zhongshu.start_index,
                     anchor_center_end_index=zhongshu.end_index,
                     anchor_center_available_time=center_confirmed_at,
+                    source_level=0,
+                    source="third_class",
+                    anchor_center_id=f"L0:zs:{zhongshu.start_index}-{zhongshu.end_index}",
+                    structure_path=[
+                        f"center:{zhongshu.start_index}-{zhongshu.end_index}",
+                        "departure:down",
+                        "first_pullback",
+                    ],
                 )
 
     sequence = _first_pullback_after_departure(
@@ -385,6 +429,14 @@ def _derive_s3(
         anchor_center_start_index=zhongshu.start_index,
         anchor_center_end_index=zhongshu.end_index,
         anchor_center_available_time=center_confirmed_at,
+        source_level=0,
+        source="third_class",
+        anchor_center_id=f"L0:zs:{zhongshu.start_index}-{zhongshu.end_index}",
+        structure_path=[
+            f"center:{zhongshu.start_index}-{zhongshu.end_index}",
+            "departure:down",
+            "first_pullback",
+        ],
     )
 
 
@@ -419,6 +471,14 @@ def generate_signals(
                 anchor_center_start_index=item.anchor_center_start_index,
                 anchor_center_end_index=item.anchor_center_end_index,
                 anchor_center_available_time=item.anchor_center_available_time,
+                source_level=getattr(item, "level", 0),
+                source="trend_divergence",
+                anchor_center_id=getattr(item, "anchor_center_id", None),
+                divergence_mode=getattr(item, "mode", None),
+                structure_path=[
+                    f"divergence:{getattr(item, 'mode', 'trend')}",
+                    f"center:{item.anchor_center_start_index}-{item.anchor_center_end_index}",
+                ],
             )
         )
 
@@ -444,7 +504,7 @@ def generate_signals(
 
     for signal in signals:
         conf = signal.confidence
-        if macd_missing:
+        if macd_missing and signal.source == "trend_divergence":
             conf -= missing_macd_penalty
         conf = _apply_phase_cap(
             signal.type, conf, market_state.phase, transitional_confidence_cap
@@ -453,6 +513,39 @@ def generate_signals(
 
     signals.sort(key=lambda x: x.confidence, reverse=True)
     return signals
+
+
+def generate_buy_sell_points(
+    signals: list[Signal],
+    divergences: list[DivergenceState],
+) -> list[BuySellPoint]:
+    divergence_by_key = {
+        (item.signal_type, item.anchor_center_start_index, item.anchor_center_end_index): item
+        for item in divergences
+        if item.signal_type is not None
+    }
+    points: list[BuySellPoint] = []
+    for signal in signals:
+        key = (
+            signal.type,
+            signal.anchor_center_start_index,
+            signal.anchor_center_end_index,
+        )
+        divergence = divergence_by_key.get(key)
+        source = signal.source
+        if source not in {"trend_divergence", "second_class", "third_class"}:
+            source = "policy"
+        points.append(
+            BuySellPoint(
+                type=signal.type,
+                level=signal.source_level,
+                source=source,  # type: ignore[arg-type]
+                signal=signal,
+                center_id=signal.anchor_center_id,
+                divergence=divergence,
+            )
+        )
+    return points
 
 
 def _best_signal(

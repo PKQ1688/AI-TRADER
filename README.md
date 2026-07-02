@@ -82,10 +82,16 @@ uv run python -m unittest discover -s tests -p "test_*.py"
   - `last_zhongshu`: `{zd, zg, gg, dd}`
   - `current_stroke_dir`: `up | down`
   - `current_segment_dir`: `up | down`
+  - `current_walk`: 当前递归走势类型、完成状态与后续可能路径
+  - `level_states`: 各递归级别的单元/中枢/走势统计
 - `signals[]`:
   - `type`: `B1 | B2 | B3 | S1 | S2 | S3`
   - `level`: `main | sub`
   - `trigger` / `invalid_if` / `confidence`
+  - `event_time` / `available_time` / `invalid_price`
+  - `source_level` / `source` / `anchor_center_id` / `structure_path`
+- `divergences[]`: 趋势背驰或盘整背驰结构状态，包含级别、方向、弱化比例和演化结果
+- `buy_sell_points[]`: 由背驰、二类确认或三类回试派生的结构买卖点
 - `action.decision`: `buy | sell | reduce | hold | wait`
 - `risk.conflict_level`: `none | low | high`
 - `cn_summary`: 中文结论

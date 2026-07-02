@@ -79,6 +79,15 @@ def _replay_row(snapshot, payload: dict, asof_close: float) -> dict:
         "zhongshu_count": payload["market_state"]["zhongshu_count"],
         "current_stroke_dir": payload["market_state"]["current_stroke_dir"],
         "current_segment_dir": payload["market_state"]["current_segment_dir"],
+        "current_walk_kind": payload["market_state"].get("current_walk", {}).get(
+            "kind", "unknown"
+        ),
+        "current_walk_status": payload["market_state"].get("current_walk", {}).get(
+            "status", "provisional"
+        ),
+        "recursive_level_count": len(payload["market_state"].get("level_states", [])),
+        "divergence_count": len(payload.get("divergences", [])),
+        "buy_sell_point_count": len(payload.get("buy_sell_points", [])),
         "previous_main_available_time": (
             iso_utc(snapshot.previous_main_bar_time)
             if snapshot.previous_main_bar_time is not None

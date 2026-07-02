@@ -8,12 +8,17 @@ from ai_trader.chan.config import ChanConfig, get_chan_config
 from ai_trader.chan.core.buy_sell_points import (
     build_risk,
     decide_action,
+    generate_buy_sell_points,
     generate_signals,
 )
 from ai_trader.chan.core.center import build_zhongshus_from_bis
-from ai_trader.chan.core.divergence import detect_divergence_candidates
+from ai_trader.chan.core.divergence import (
+    detect_divergence_candidates,
+    divergence_states,
+)
 from ai_trader.chan.core.fractal import detect_fractals
 from ai_trader.chan.core.include import merge_inclusions
+from ai_trader.chan.core.recursive import build_recursive_levels_from_bis
 from ai_trader.chan.core.segment import build_segments
 from ai_trader.chan.core.stroke import build_bis
 from ai_trader.chan.core.trend_phase import infer_market_state
@@ -93,6 +98,8 @@ def _insufficient_snapshot(
         trend_type_main="range",
         market_state_main=MarketState(trend_type="range"),
         data_quality=DataQuality(status="insufficient", notes=notes),
+        structure_levels_main=[],
+        structure_levels_sub=[],
     )
 
 
@@ -145,15 +152,40 @@ def build_chan_state(
         bis_sub, require_case2_confirmation=cfg.require_case2_confirmation
     )
 
-    zhongshus_main = build_zhongshus_from_bis(bis_main)
-    zhongshus_sub = build_zhongshus_from_bis(bis_sub)
+    structure_levels_main = build_recursive_levels_from_bis(
+        bis_main,
+        timeframe=timeframe_main,
+        max_depth=3,
+    )
+    structure_levels_sub = build_recursive_levels_from_bis(
+        bis_sub,
+        timeframe=timeframe_sub,
+        max_depth=3,
+    )
+
+    zhongshus_main = [
+        center.zhongshu
+        for level in structure_levels_main[:1]
+        for center in level.centers
+        if center.level == 0
+    ] or build_zhongshus_from_bis(bis_main)
+    zhongshus_sub = [
+        center.zhongshu
+        for level in structure_levels_sub[:1]
+        for center in level.centers
+        if center.level == 0
+    ] or build_zhongshus_from_bis(bis_sub)
 
     normalized_macd_main = _normalize_macd(macd_main, raw_main)
     normalized_macd_sub = _normalize_macd(macd_sub, raw_sub)
 
     last_close = merged_main[-1].close if merged_main else 0.0
     market_state = infer_market_state(
-        last_close, bis_main, segments_main, zhongshus_main
+        last_close,
+        bis_main,
+        segments_main,
+        zhongshus_main,
+        structure_levels=structure_levels_main,
     )
 
     return ChanSnapshot(
@@ -179,6 +211,8 @@ def build_chan_state(
         trend_type_main=market_state.trend_type,
         market_state_main=market_state,
         data_quality=DataQuality(status="ok", notes=""),
+        structure_levels_main=structure_levels_main,
+        structure_levels_sub=structure_levels_sub,
     )
 
 
@@ -545,6 +579,7 @@ def generate_signal(
         ),
     )
     divergence = _sub_interval_confirmed(snapshot, divergence, threshold, cfg)
+    divergence_state_items = divergence_states(divergence)
 
     macd_missing = len(snapshot.macd_main) == 0
     signals = generate_signals(
@@ -562,6 +597,7 @@ def generate_signal(
 
     fresh_signals = _fresh_signals(snapshot, signals)
     fresh_signals = _drop_invalidated_fresh_signals(snapshot, fresh_signals)
+    buy_sell_points = generate_buy_sell_points(fresh_signals, divergence_state_items)
 
     conflict_level, conflict_note = _conflict_level(snapshot)
     oscillation_note = _oscillation_note(market_state)
@@ -587,4 +623,6 @@ def generate_signal(
         action=action,
         risk=build_risk(conflict_level, risk_note),
         cn_summary=summary,
+        divergences=divergence_state_items,
+        buy_sell_points=buy_sell_points,
     )

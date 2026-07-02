@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 TrendType = Literal["up", "down", "range"]
 WalkType = Literal["consolidation", "trend"]
+ChanWalkKind = Literal["trend_up", "trend_down", "consolidation", "unknown"]
+ChanUnitKind = Literal["bar", "fractal", "bi", "segment", "walk"]
 PhaseType = Literal["trending", "consolidating", "transitional"]
 SignalType = Literal["B1", "B2", "B3", "S1", "S2", "S3"]
 SignalLevel = Literal["main", "sub"]
@@ -13,6 +15,8 @@ DecisionType = Literal["buy", "sell", "reduce", "hold", "wait"]
 ConflictLevel = Literal["none", "low", "high"]
 StructureStatus = Literal["provisional", "confirmed"]
 ZhongshuEvolution = Literal["newborn", "extension", "expansion"]
+DivergenceMode = Literal["trend", "consolidation"]
+ConsolidationOutcome = Literal["unknown", "return_to_center", "third_class", "expansion"]
 
 
 def parse_utc_time(value: datetime | str | int | float) -> datetime:
@@ -155,6 +159,245 @@ class Zhongshu:
 
 
 @dataclass(slots=True)
+class StructureUnit:
+    """A recursive Chan structure unit.
+
+    At the lowest tradable level this can represent a Bi. At higher levels it
+    represents a completed lower-level walk, so the same center/walk builders
+    can be reused recursively.
+    """
+
+    id: str
+    level: int
+    kind: ChanUnitKind
+    direction: Literal["up", "down", "none"]
+    start_index: int
+    end_index: int
+    high: float
+    low: float
+    start_price: float
+    end_price: float
+    event_time: datetime
+    available_time: datetime
+    status: StructureStatus = "confirmed"
+    source_ids: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.event_time = parse_utc_time(self.event_time)
+        self.available_time = parse_utc_time(self.available_time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "level": self.level,
+            "kind": self.kind,
+            "direction": self.direction,
+            "start_index": self.start_index,
+            "end_index": self.end_index,
+            "high": self.high,
+            "low": self.low,
+            "start_price": self.start_price,
+            "end_price": self.end_price,
+            "event_time": iso_utc(self.event_time),
+            "available_time": iso_utc(self.available_time),
+            "status": self.status,
+            "source_ids": list(self.source_ids),
+        }
+
+
+@dataclass(slots=True)
+class CenterState:
+    id: str
+    level: int
+    zhongshu: Zhongshu
+    source_unit_ids: list[str]
+    evolution: ZhongshuEvolution = "newborn"
+    parent_center_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "level": self.level,
+            "zd": self.zhongshu.zd,
+            "zg": self.zhongshu.zg,
+            "gg": self.zhongshu.gg,
+            "dd": self.zhongshu.dd,
+            "g": self.zhongshu.g,
+            "d": self.zhongshu.d,
+            "start_index": self.zhongshu.start_index,
+            "end_index": self.zhongshu.end_index,
+            "event_time": iso_utc(self.zhongshu.event_time),
+            "available_time": iso_utc(self.zhongshu.available_time),
+            "origin_available_time": iso_utc(self.zhongshu.origin_available_time),
+            "evolution": self.evolution,
+            "status": self.zhongshu.status,
+            "source_unit_ids": list(self.source_unit_ids),
+            "parent_center_id": self.parent_center_id,
+        }
+
+
+@dataclass(slots=True)
+class WalkState:
+    id: str
+    level: int
+    kind: ChanWalkKind
+    start_index: int
+    end_index: int
+    high: float
+    low: float
+    event_time: datetime
+    available_time: datetime
+    center_ids: list[str] = field(default_factory=list)
+    source_unit_ids: list[str] = field(default_factory=list)
+    status: StructureStatus = "confirmed"
+
+    def __post_init__(self) -> None:
+        self.event_time = parse_utc_time(self.event_time)
+        self.available_time = parse_utc_time(self.available_time)
+
+    @property
+    def direction(self) -> Literal["up", "down", "none"]:
+        if self.kind == "trend_up":
+            return "up"
+        if self.kind == "trend_down":
+            return "down"
+        return "none"
+
+    def to_unit(self) -> StructureUnit:
+        direction = self.direction
+        if direction == "up":
+            start_price, end_price = self.low, self.high
+        elif direction == "down":
+            start_price, end_price = self.high, self.low
+        else:
+            start_price = end_price = (self.high + self.low) / 2
+        return StructureUnit(
+            id=self.id,
+            level=self.level + 1,
+            kind="walk",
+            direction=direction,
+            start_index=self.start_index,
+            end_index=self.end_index,
+            high=self.high,
+            low=self.low,
+            start_price=start_price,
+            end_price=end_price,
+            event_time=self.event_time,
+            available_time=self.available_time,
+            status=self.status,
+            source_ids=list(self.source_unit_ids),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "level": self.level,
+            "kind": self.kind,
+            "direction": self.direction,
+            "start_index": self.start_index,
+            "end_index": self.end_index,
+            "high": self.high,
+            "low": self.low,
+            "event_time": iso_utc(self.event_time),
+            "available_time": iso_utc(self.available_time),
+            "center_ids": list(self.center_ids),
+            "source_unit_ids": list(self.source_unit_ids),
+            "status": self.status,
+        }
+
+
+@dataclass(slots=True)
+class ChanLevel:
+    level: int
+    timeframe: str
+    units: list[StructureUnit] = field(default_factory=list)
+    centers: list[CenterState] = field(default_factory=list)
+    walks: list[WalkState] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "level": self.level,
+            "timeframe": self.timeframe,
+            "units": [item.to_dict() for item in self.units],
+            "centers": [item.to_dict() for item in self.centers],
+            "walks": [item.to_dict() for item in self.walks],
+        }
+
+
+@dataclass(slots=True)
+class DivergenceState:
+    mode: DivergenceMode
+    direction: Literal["up", "down"]
+    signal_type: SignalType | None
+    level: int
+    confidence: float
+    weaken_ratio: float
+    trigger: str
+    invalid_if: str
+    invalid_price: float
+    event_time: datetime
+    available_time: datetime
+    anchor_center_id: str | None = None
+    anchor_center_start_index: int | None = None
+    anchor_center_end_index: int | None = None
+    anchor_center_available_time: datetime | None = None
+    outcome: ConsolidationOutcome = "unknown"
+
+    def __post_init__(self) -> None:
+        self.event_time = parse_utc_time(self.event_time)
+        self.available_time = parse_utc_time(self.available_time)
+        if self.anchor_center_available_time is not None:
+            self.anchor_center_available_time = parse_utc_time(
+                self.anchor_center_available_time
+            )
+        self.confidence = max(0.0, min(1.0, float(self.confidence)))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "direction": self.direction,
+            "signal_type": self.signal_type,
+            "level": self.level,
+            "confidence": self.confidence,
+            "weaken_ratio": self.weaken_ratio,
+            "trigger": self.trigger,
+            "invalid_if": self.invalid_if,
+            "invalid_price": self.invalid_price,
+            "event_time": iso_utc(self.event_time),
+            "available_time": iso_utc(self.available_time),
+            "anchor_center_id": self.anchor_center_id,
+            "anchor_center_start_index": self.anchor_center_start_index,
+            "anchor_center_end_index": self.anchor_center_end_index,
+            "anchor_center_available_time": (
+                iso_utc(self.anchor_center_available_time)
+                if self.anchor_center_available_time is not None
+                else None
+            ),
+            "outcome": self.outcome,
+        }
+
+
+@dataclass(slots=True)
+class BuySellPoint:
+    type: SignalType
+    level: int
+    source: Literal["trend_divergence", "second_class", "third_class", "policy"]
+    signal: Signal
+    center_id: str | None = None
+    divergence: DivergenceState | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "level": self.level,
+            "source": self.source,
+            "center_id": self.center_id,
+            "signal": self.signal.to_contract_dict(),
+            "divergence": self.divergence.to_dict() if self.divergence else None,
+        }
+
+
+@dataclass(slots=True)
 class Signal:
     type: SignalType
     level: SignalLevel
@@ -167,6 +410,11 @@ class Signal:
     anchor_center_start_index: int | None = None
     anchor_center_end_index: int | None = None
     anchor_center_available_time: datetime | None = None
+    source_level: int = 0
+    source: str = "legacy"
+    anchor_center_id: str | None = None
+    divergence_mode: str | None = None
+    structure_path: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.event_time = parse_utc_time(self.event_time)
@@ -184,6 +432,16 @@ class Signal:
             "trigger": self.trigger,
             "invalid_if": self.invalid_if,
             "confidence": self.confidence,
+            "event_time": iso_utc(self.event_time),
+            "available_time": iso_utc(self.available_time),
+            "invalid_price": self.invalid_price,
+            "source_level": self.source_level,
+            "source": self.source,
+            "anchor_center_id": self.anchor_center_id,
+            "anchor_center_start_index": self.anchor_center_start_index,
+            "anchor_center_end_index": self.anchor_center_end_index,
+            "divergence_mode": self.divergence_mode,
+            "structure_path": list(self.structure_path),
         }
 
 
@@ -202,6 +460,17 @@ class MarketState:
     last_zhongshu: dict[str, float] = field(default_factory=lambda: {"zd": 0.0, "zg": 0.0, "gg": 0.0, "dd": 0.0})
     current_stroke_dir: Literal["up", "down"] = "up"
     current_segment_dir: Literal["up", "down"] = "up"
+    current_walk: dict[str, Any] = field(
+        default_factory=lambda: {
+            "id": None,
+            "level": 0,
+            "kind": "unknown",
+            "status": "provisional",
+            "missing_sub_walks": 3,
+            "possible_next": ["consolidation", "trend_up", "trend_down"],
+        }
+    )
+    level_states: list[dict[str, Any]] = field(default_factory=list)
     oscillation_state: dict[str, Any] = field(
         default_factory=lambda: {
             "anchor_source": "none",
@@ -243,6 +512,8 @@ class SignalDecision:
     action: Action
     risk: Risk
     cn_summary: str
+    divergences: list[DivergenceState] = field(default_factory=list)
+    buy_sell_points: list[BuySellPoint] = field(default_factory=list)
 
     def to_contract_dict(self) -> dict[str, Any]:
         return {
@@ -259,9 +530,13 @@ class SignalDecision:
                 "last_zhongshu": self.market_state.last_zhongshu,
                 "current_stroke_dir": self.market_state.current_stroke_dir,
                 "current_segment_dir": self.market_state.current_segment_dir,
+                "current_walk": self.market_state.current_walk,
+                "level_states": self.market_state.level_states,
                 "oscillation_state": self.market_state.oscillation_state,
             },
             "signals": [item.to_contract_dict() for item in self.signals],
+            "divergences": [item.to_dict() for item in self.divergences],
+            "buy_sell_points": [item.to_dict() for item in self.buy_sell_points],
             "action": asdict(self.action),
             "risk": asdict(self.risk),
             "cn_summary": self.cn_summary,
@@ -292,6 +567,9 @@ class ChanSnapshot:
     trend_type_main: TrendType = "range"
     market_state_main: MarketState | None = None
     data_quality: DataQuality = field(default_factory=lambda: DataQuality(status="insufficient", notes=""))
+    structure_levels_main: list[ChanLevel] = field(default_factory=list)
+    structure_levels_sub: list[ChanLevel] = field(default_factory=list)
+    divergences_main: list[DivergenceState] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.asof_time = parse_utc_time(self.asof_time)

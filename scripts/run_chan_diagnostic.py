@@ -155,7 +155,31 @@ def main() -> None:
             "segments_sub": len(snapshot.segments_sub),
             "zhongshus_main": len(snapshot.zhongshus_main),
             "zhongshus_sub": len(snapshot.zhongshus_sub),
+            "structure_levels_main": len(snapshot.structure_levels_main),
+            "structure_levels_sub": len(snapshot.structure_levels_sub),
+            "divergences": len(payload.get("divergences", [])),
+            "buy_sell_points": len(payload.get("buy_sell_points", [])),
         },
+        "structure_levels_main": [
+            {
+                "level": item.level,
+                "timeframe": item.timeframe,
+                "units": len(item.units),
+                "centers": len(item.centers),
+                "walks": len(item.walks),
+            }
+            for item in snapshot.structure_levels_main
+        ],
+        "structure_levels_sub": [
+            {
+                "level": item.level,
+                "timeframe": item.timeframe,
+                "units": len(item.units),
+                "centers": len(item.centers),
+                "walks": len(item.walks),
+            }
+            for item in snapshot.structure_levels_sub
+        ],
         "tail": {
             "fractals_main": [_fractal_row(x) for x in snapshot.fractals_main[-8:]],
             "bis_main": [_bi_row(x) for x in snapshot.bis_main[-8:]],
@@ -170,6 +194,22 @@ def main() -> None:
 
     (out_dir / "snapshot_meta.json").write_text(json.dumps(snapshot_meta, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "decision.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "structure_levels_main.json").write_text(
+        json.dumps(
+            [item.to_dict() for item in snapshot.structure_levels_main],
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (out_dir / "structure_levels_sub.json").write_text(
+        json.dumps(
+            [item.to_dict() for item in snapshot.structure_levels_sub],
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     write_csv_rows(out_dir / "fractals_main.csv", [_fractal_row(x) for x in snapshot.fractals_main])
     write_csv_rows(out_dir / "fractals_sub.csv", [_fractal_row(x) for x in snapshot.fractals_sub])
@@ -198,7 +238,11 @@ def main() -> None:
         f"- zhongshu_count: {payload['market_state']['zhongshu_count']}",
         f"- current_stroke_dir: {payload['market_state']['current_stroke_dir']}",
         f"- current_segment_dir: {payload['market_state']['current_segment_dir']}",
+        f"- current_walk: {payload['market_state'].get('current_walk')}",
+        f"- recursive_levels: {len(snapshot.structure_levels_main)}",
         f"- last_zhongshu: {payload['market_state']['last_zhongshu']}",
+        f"- divergences: {len(payload.get('divergences', []))}",
+        f"- buy_sell_points: {len(payload.get('buy_sell_points', []))}",
         "",
     ]
     summary_lines.extend(_decision_block(payload))

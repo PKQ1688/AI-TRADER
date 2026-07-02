@@ -14,7 +14,7 @@ from ai_trader.chan.core.divergence import (
     detect_divergence_candidates,
 )
 from ai_trader.chan.core.fractal import detect_fractals
-from ai_trader.chan.core.include import merge_inclusions
+from ai_trader.chan.core.include import merge_inclusions, merge_inclusions_with_trace
 from ai_trader.chan.core.segment import build_segments
 from ai_trader.chan.core.stroke import build_bis
 from ai_trader.chan.core.trend_phase import infer_market_state
@@ -107,6 +107,20 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertEqual(len(merged), 3)
         self.assertEqual((merged[1].high, merged[1].low), (12, 7))
         self.assertEqual((merged[2].high, merged[2].low), (13, 9))
+
+    def test_merge_inclusions_down_direction_trace(self) -> None:
+        bars = [
+            Bar(time=self._t(0), open=16, high=20, low=10, close=12),
+            Bar(time=self._t(1), open=12, high=18, low=8, close=9),
+            Bar(time=self._t(2), open=9, high=17, low=9, close=15),
+        ]
+
+        merged, traces = merge_inclusions_with_trace(bars)
+
+        self.assertEqual(len(merged), 2)
+        self.assertEqual((merged[1].high, merged[1].low), (17, 8))
+        self.assertEqual(traces[1].raw_indices, [1, 2])
+        self.assertEqual(traces[1].direction, -1)
 
     def test_bi_rules_alternating_and_min_length(self) -> None:
         bars = make_synthetic_bars(start=self._t(0), count=220, step_hours=4)
@@ -2939,6 +2953,56 @@ class ChanCoreRulesTest(unittest.TestCase):
         bis = build_bis(fractals, bars, min_bars=5)
 
         self.assertEqual(bis, [])
+
+    def test_bi_extends_previous_endpoint_to_keep_connected_sequence(self) -> None:
+        bars = [
+            Bar(time=self._t(i), open=8.0, high=9.0, low=6.0, close=8.0)
+            for i in range(16)
+        ]
+        bars[2] = Bar(time=self._t(2), open=5.0, high=5.5, low=4.0, close=4.5)
+        bars[6] = Bar(time=self._t(6), open=11.0, high=12.0, low=10.0, close=11.5)
+        bars[10] = Bar(time=self._t(10), open=13.0, high=14.0, low=12.0, close=13.5)
+        bars[14] = Bar(time=self._t(14), open=6.0, high=6.5, low=5.0, close=5.5)
+        fractals = [
+            Fractal(
+                kind="bottom",
+                index=2,
+                price=4.0,
+                event_time=self._t(2),
+                available_time=self._t(3),
+            ),
+            Fractal(
+                kind="top",
+                index=6,
+                price=12.0,
+                event_time=self._t(6),
+                available_time=self._t(7),
+            ),
+            Fractal(
+                kind="top",
+                index=10,
+                price=14.0,
+                event_time=self._t(10),
+                available_time=self._t(11),
+            ),
+            Fractal(
+                kind="bottom",
+                index=14,
+                price=5.0,
+                event_time=self._t(14),
+                available_time=self._t(15),
+            ),
+        ]
+
+        bis = build_bis(fractals, bars, min_bars=5)
+
+        self.assertEqual(len(bis), 2)
+        self.assertEqual((bis[0].start_index, bis[0].end_index), (2, 10))
+        self.assertEqual((bis[1].start_index, bis[1].end_index), (10, 14))
+        self.assertEqual(bis[0].end_index, bis[1].start_index)
+        self.assertEqual(bis[0].end_price, bis[1].start_price)
+        self.assertEqual(bis[0].event_time, self._t(10))
+        self.assertEqual(bis[0].available_time, self._t(11))
 
     def test_bi_zhongshu_extension_shrinks_overlap_range(self) -> None:
         zhongshus = build_zhongshus_from_bis(
