@@ -13,6 +13,7 @@ from ai_trader.types import (
     Risk,
     Segment,
     Signal,
+    WalkState,
     Zhongshu,
 )
 
@@ -84,7 +85,7 @@ def _first_pullback_after_departure(
     confirmed = [
         item
         for item in _confirmed_segments(segments_sub)
-        if item.available_time >= center_confirmed_at
+        if item.available_time > center_confirmed_at
     ]
     if len(confirmed) < 3:
         return None
@@ -100,9 +101,6 @@ def _first_pullback_after_departure(
         departure_end = confirmed[departure_end_idx]
         if departure_end.direction != departure_direction:
             continue
-        if departure_end.start_index < zhongshu.end_index:
-            continue
-
         if departure_direction == "up" and departure_end.high <= zhongshu.zg:
             continue
         if departure_direction == "down" and departure_end.low >= zhongshu.zd:
@@ -139,7 +137,7 @@ def _first_bi_pullback_after_departure(
     confirmed = [
         item
         for item in bis_context
-        if item.status == "confirmed" and item.available_time >= center_confirmed_at
+        if item.status == "confirmed" and item.available_time > center_confirmed_at
     ]
     if len(confirmed) < 3:
         return None
@@ -150,8 +148,6 @@ def _first_bi_pullback_after_departure(
 
     for item in confirmed:
         if not saw_departure:
-            if item.start_index < zhongshu.end_index:
-                continue
             if item.direction != departure_direction:
                 continue
             if departure_direction == "up" and item.high <= zhongshu.zg:
@@ -222,7 +218,7 @@ def _derive_b2(
     retrace_bi, confirm_bi = sequence
 
     invalid_price = b1.invalid_price
-    if invalid_price is not None and retrace_bi.low <= invalid_price:
+    if invalid_price is not None and retrace_bi.low < invalid_price:
         return None
 
     return Signal(
@@ -263,7 +259,7 @@ def _derive_s2(
     retrace_bi, confirm_bi = sequence
 
     invalid_price = s1.invalid_price
-    if invalid_price is not None and retrace_bi.high >= invalid_price:
+    if invalid_price is not None and retrace_bi.high > invalid_price:
         return None
 
     return Signal(
@@ -304,7 +300,7 @@ def _derive_b3(
         )
         if sequence is not None:
             pullback_bi, confirm_bi = sequence
-            if pullback_bi.low > zhongshu.zg and confirm_bi.low > zhongshu.zg:
+            if pullback_bi.low >= zhongshu.zg and confirm_bi.low >= zhongshu.zg:
                 available_time = max(confirm_bi.available_time, center_confirmed_at)
                 return Signal(
                     type="B3",
@@ -336,7 +332,7 @@ def _derive_b3(
     if sequence is None:
         return None
     pullback, confirm = sequence
-    if pullback.low <= zhongshu.zg or confirm.low <= zhongshu.zg:
+    if pullback.low < zhongshu.zg or confirm.low < zhongshu.zg:
         return None
 
     available_time = max(confirm.available_time, center_confirmed_at)
@@ -381,7 +377,7 @@ def _derive_s3(
         )
         if sequence is not None:
             pullback_bi, confirm_bi = sequence
-            if pullback_bi.high < zhongshu.zd and confirm_bi.high < zhongshu.zd:
+            if pullback_bi.high <= zhongshu.zd and confirm_bi.high <= zhongshu.zd:
                 available_time = max(confirm_bi.available_time, center_confirmed_at)
                 return Signal(
                     type="S3",
@@ -413,7 +409,7 @@ def _derive_s3(
     if sequence is None:
         return None
     pullback, confirm = sequence
-    if pullback.high >= zhongshu.zd or confirm.high >= zhongshu.zd:
+    if pullback.high > zhongshu.zd or confirm.high > zhongshu.zd:
         return None
 
     available_time = max(confirm.available_time, center_confirmed_at)
@@ -440,6 +436,166 @@ def _derive_s3(
     )
 
 
+def _strict_second_class_from_walks(
+    first_class: Signal,
+    walks: list[WalkState],
+) -> Signal | None:
+    is_buy = first_class.type == "B1"
+    departure_direction = "up" if is_buy else "down"
+    retrace_direction = "down" if is_buy else "up"
+    post = [
+        item
+        for item in walks
+        if item.status == "confirmed"
+        and item.available_time > first_class.available_time
+    ]
+
+    saw_departure = False
+    for walk in post:
+        if not saw_departure:
+            if walk.direction == departure_direction:
+                saw_departure = True
+            continue
+        if walk.direction == departure_direction:
+            continue
+        if walk.direction != retrace_direction:
+            continue
+
+        first_price = first_class.invalid_price
+        weak = False
+        if first_price is not None:
+            weak = walk.low < first_price if is_buy else walk.high > first_price
+
+        signal_type = "B2" if is_buy else "S2"
+        weak_label = "弱二买" if is_buy else "弱二卖"
+        normal_trigger = (
+            "一买后首个已完成次级别回抽结束"
+            if is_buy
+            else "一卖后首个已完成次级别反抽结束"
+        )
+        trigger = (
+            f"{normal_trigger}；{weak_label}越过一类点，仅记录不执行"
+            if weak
+            else normal_trigger
+        )
+        invalid_price = (
+            walk.low
+            if is_buy and weak
+            else walk.high
+            if (not is_buy and weak)
+            else first_price
+        )
+        invalid_if = (
+            f"价格继续跌破{invalid_price:.2f}"
+            if is_buy and invalid_price is not None
+            else f"价格继续突破{invalid_price:.2f}"
+            if invalid_price is not None
+            else first_class.invalid_if
+        )
+        return Signal(
+            type=signal_type,  # type: ignore[arg-type]
+            level="sub",
+            trigger=trigger,
+            invalid_if=invalid_if,
+            confidence=1.0,
+            event_time=walk.event_time,
+            available_time=walk.available_time,
+            invalid_price=invalid_price,
+            anchor_center_start_index=first_class.anchor_center_start_index,
+            anchor_center_end_index=first_class.anchor_center_end_index,
+            anchor_center_available_time=(
+                first_class.anchor_center_available_time
+            ),
+            source_level=first_class.source_level,
+            source="second_class",
+            anchor_center_id=first_class.anchor_center_id,
+            divergence_mode=first_class.divergence_mode,
+            structure_path=list(first_class.structure_path)
+            + [f"{signal_type}:{'weak' if weak else 'standard'}"],
+            executable=not weak,
+        )
+    return None
+
+
+def _strict_third_class_from_walks(
+    walks: list[WalkState],
+    center: Zhongshu | None,
+    *,
+    direction: str,
+    structure_level: int,
+) -> Signal | None:
+    if center is None:
+        return None
+
+    center_confirmed_at = center.origin_available_time or center.available_time
+    post = [
+        item
+        for item in walks
+        if item.status == "confirmed"
+        and item.start_index >= center.end_index
+        and item.available_time >= center_confirmed_at
+    ]
+    retrace_direction = "down" if direction == "up" else "up"
+    departure_seen = False
+    for walk in post:
+        if not departure_seen:
+            if walk.direction != direction:
+                continue
+            if direction == "up" and walk.high <= center.zg:
+                continue
+            if direction == "down" and walk.low >= center.zd:
+                continue
+            departure_seen = True
+            continue
+
+        if walk.direction == direction:
+            continue
+        if walk.direction != retrace_direction:
+            continue
+
+        boundary = center.zg if direction == "up" else center.zd
+        outside = walk.low >= boundary if direction == "up" else walk.high <= boundary
+        if not outside:
+            # The definition requires the first completed return.  Once that
+            # return re-enters the center, this departure cannot later be
+            # relabeled as a third-class point.
+            return None
+
+        signal_type = "B3" if direction == "up" else "S3"
+        return Signal(
+            type=signal_type,  # type: ignore[arg-type]
+            level="main",
+            trigger=(
+                "已完成次级别向上离开后，首次已完成回抽未跌破中枢上沿"
+                if direction == "up"
+                else "已完成次级别向下离开后，首次已完成反抽未突破中枢下沿"
+            ),
+            invalid_if=(
+                f"价格跌回中枢上沿{boundary:.2f}下方"
+                if direction == "up"
+                else f"价格重新站回中枢下沿{boundary:.2f}上方"
+            ),
+            confidence=1.0,
+            event_time=walk.event_time,
+            available_time=max(walk.available_time, center_confirmed_at),
+            invalid_price=boundary,
+            anchor_center_start_index=center.start_index,
+            anchor_center_end_index=center.end_index,
+            anchor_center_available_time=center_confirmed_at,
+            source_level=structure_level,
+            source="third_class",
+            anchor_center_id=(
+                f"L{structure_level}:zs:{center.start_index}-{center.end_index}"
+            ),
+            structure_path=[
+                f"center:{center.start_index}-{center.end_index}",
+                f"completed_departure:{direction}",
+                "completed_first_return_outside",
+            ],
+        )
+    return None
+
+
 def generate_signals(
     divergence_candidates: list[DivergenceCandidate],
     bis_sub: list[Bi],
@@ -451,6 +607,9 @@ def generate_signals(
     transitional_confidence_cap: float,
     zhongshus_sub: list[Zhongshu] | None = None,
     bis_context: list[Bi] | None = None,
+    structural_walks: list[WalkState] | None = None,
+    strict_mode: bool = False,
+    structure_level: int = 0,
 ) -> list[Signal]:
     zhongshus_sub = zhongshus_sub or []
     signals: list[Signal] = []
@@ -464,7 +623,7 @@ def generate_signals(
                 level="main",
                 trigger=item.trigger,
                 invalid_if=item.invalid_if,
-                confidence=item.confidence,
+                confidence=1.0 if strict_mode else item.confidence,
                 event_time=item.event_time,
                 available_time=item.available_time,
                 invalid_price=item.invalid_price,
@@ -486,30 +645,57 @@ def generate_signals(
     s1 = next((x for x in signals if x.type == "S1"), None)
 
     if b1 is not None:
-        b2 = _derive_b2(b1, bis_sub, zhongshus_sub)
+        b2 = (
+            _strict_second_class_from_walks(b1, structural_walks or [])
+            if strict_mode
+            else _derive_b2(b1, bis_sub, zhongshus_sub)
+        )
         if b2 is not None:
             signals.append(b2)
     if s1 is not None:
-        s2 = _derive_s2(s1, bis_sub, zhongshus_sub)
+        s2 = (
+            _strict_second_class_from_walks(s1, structural_walks or [])
+            if strict_mode
+            else _derive_s2(s1, bis_sub, zhongshus_sub)
+        )
         if s2 is not None:
             signals.append(s2)
 
-    b3 = _derive_b3(segments_sub, zhongshu_main, bis_context=bis_context)
+    b3 = (
+        _strict_third_class_from_walks(
+            structural_walks or [],
+            zhongshu_main,
+            direction="up",
+            structure_level=structure_level,
+        )
+        if strict_mode
+        else _derive_b3(segments_sub, zhongshu_main, bis_context=bis_context)
+    )
     if b3 is not None:
         signals.append(b3)
 
-    s3 = _derive_s3(segments_sub, zhongshu_main, bis_context=bis_context)
+    s3 = (
+        _strict_third_class_from_walks(
+            structural_walks or [],
+            zhongshu_main,
+            direction="down",
+            structure_level=structure_level,
+        )
+        if strict_mode
+        else _derive_s3(segments_sub, zhongshu_main, bis_context=bis_context)
+    )
     if s3 is not None:
         signals.append(s3)
 
-    for signal in signals:
-        conf = signal.confidence
-        if macd_missing and signal.source == "trend_divergence":
-            conf -= missing_macd_penalty
-        conf = _apply_phase_cap(
-            signal.type, conf, market_state.phase, transitional_confidence_cap
-        )
-        signal.confidence = _clamp01(conf)
+    if not strict_mode:
+        for signal in signals:
+            conf = signal.confidence
+            if macd_missing and signal.source == "trend_divergence":
+                conf -= missing_macd_penalty
+            conf = _apply_phase_cap(
+                signal.type, conf, market_state.phase, transitional_confidence_cap
+            )
+            signal.confidence = _clamp01(conf)
 
     signals.sort(key=lambda x: x.confidence, reverse=True)
     return signals
@@ -552,7 +738,11 @@ def _best_signal(
     signals: Iterable[Signal], kinds: set[str], min_confidence: float
 ) -> Signal | None:
     candidates = [
-        x for x in signals if x.type in kinds and x.confidence >= min_confidence
+        x
+        for x in signals
+        if x.executable
+        and x.type in kinds
+        and x.confidence >= min_confidence
     ]
     if not candidates:
         return None
@@ -610,7 +800,11 @@ def decide_action(
     allow_high_conflict_buy = allow_high_conflict_reversal(best_buy, market_state)
     allow_high_conflict_sell = allow_high_conflict_reversal(best_sell, market_state)
 
-    if market_state.phase == "transitional":
+    strict_third_class_confirmation = (
+        getattr(chan_config, "mode", None) in {"strict_recursive", "strict_kline8"}
+        and (best_b3 is not None or best_s3 is not None)
+    )
+    if market_state.phase == "transitional" and not strict_third_class_confirmation:
         if best_reduce is not None:
             return (
                 Action(decision="reduce", reason="中阴阶段卖点仅用于降风险"),
@@ -660,6 +854,10 @@ def decide_action(
         best_buy is not None
         and chan_config.require_non_high_conflict_buy
         and market_state.phase != "trending"
+        and not (
+            getattr(chan_config, "mode", None) in {"strict_recursive", "strict_kline8"}
+            and best_buy.type == "B3"
+        )
     ):
         return Action(
             decision="wait", reason="买点出现但走势阶段未确认"

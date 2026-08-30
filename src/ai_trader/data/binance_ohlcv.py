@@ -182,7 +182,14 @@ def _fetch_with_ccxt_ms(exchange: str, symbol: str, timeframe: str, start_ms: in
     return _bars_from_ohlcv_rows(rows, start_ms=start_ms, end_ms=end_ms)
 
 
-def _fetch_with_binance_rest_ms(symbol: str, timeframe: str, start_ms: int, end_ms: int) -> list[Bar]:
+def _fetch_with_binance_rest_ms(
+    symbol: str,
+    timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    market: str = "spot",
+) -> list[Bar]:
     try:
         import requests
     except Exception as exc:  # pragma: no cover
@@ -193,13 +200,20 @@ def _fetch_with_binance_rest_ms(symbol: str, timeframe: str, start_ms: int, end_
     base, quote = symbol.split("/", 1)
     pair = f"{base}{quote}"
 
+    if market == "spot":
+        endpoint = "https://api.binance.com/api/v3/klines"
+    elif market == "usdm":
+        endpoint = "https://fapi.binance.com/fapi/v1/klines"
+    else:
+        raise ValueError(f"Unsupported Binance market: {market}")
+
     rows: list[list[float]] = []
     cursor = start_ms
     step = _timeframe_to_ms(timeframe)
 
     while cursor <= end_ms:
         response = requests.get(
-            "https://api.binance.com/api/v3/klines",
+            endpoint,
             params={
                 "symbol": pair,
                 "interval": timeframe,
@@ -228,14 +242,29 @@ def _fetch_range_with_retry(exchange: str, symbol: str, timeframe: str, start_ms
 
     for idx in range(max_retries):
         try:
-            if exchange.lower() == "binance":
-                return _fetch_with_binance_rest_ms(symbol=symbol, timeframe=timeframe, start_ms=start_ms, end_ms=end_ms)
+            exchange_key = exchange.lower()
+            if exchange_key == "binance":
+                return _fetch_with_binance_rest_ms(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    market="spot",
+                )
+            if exchange_key == "binanceusdm":
+                return _fetch_with_binance_rest_ms(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    market="usdm",
+                )
             return _fetch_with_ccxt_ms(exchange=exchange, symbol=symbol, timeframe=timeframe, start_ms=start_ms, end_ms=end_ms)
         except Exception as exc:
             last_error = exc
             time.sleep(min(8, 2**idx))
 
-    if exchange.lower() == "binance":
+    if exchange.lower() in {"binance", "binanceusdm"}:
         # fallback once with ccxt (some network path差异时可命中)
         try:
             return _fetch_with_ccxt_ms(exchange=exchange, symbol=symbol, timeframe=timeframe, start_ms=start_ms, end_ms=end_ms)

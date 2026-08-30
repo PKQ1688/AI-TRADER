@@ -74,6 +74,14 @@ def build_bis(fractals: list[Fractal], bars: list[Bar], min_bars: int = 5) -> li
 
         if _valid_bi_pair(start, fx, bars, min_bars):
             direction = "up" if start.kind == "bottom" else "down"
+            if bis:
+                # A bi endpoint can still be replaced by a later, more
+                # extreme same-kind fractal.  The next valid opposite bi is
+                # what fixes that endpoint and confirms the previous bi.
+                bis[-1].status = "confirmed"
+                bis[-1].available_time = max(
+                    bis[-1].available_time, fx.available_time
+                )
             bis.append(
                 Bi(
                     direction=direction,
@@ -83,7 +91,7 @@ def build_bis(fractals: list[Fractal], bars: list[Bar], min_bars: int = 5) -> li
                     end_price=fx.price,
                     event_time=fx.event_time,
                     available_time=max(start.available_time, fx.available_time),
-                    status="confirmed",
+                    status="provisional",
                 )
             )
             start = fx

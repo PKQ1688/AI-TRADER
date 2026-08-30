@@ -9,9 +9,12 @@ from ai_trader.types import (
     DivergenceState,
     MACDPoint,
     SignalType,
+    StructureUnit,
     TrendType,
     Zhongshu,
 )
+
+TrendUnit = Bi | StructureUnit
 
 
 @dataclass(slots=True)
@@ -121,7 +124,7 @@ def _zero_axis_pullback(
 
 
 def _center_member_span(
-    bis: list[Bi], center: Zhongshu
+    bis: list[TrendUnit], center: Zhongshu
 ) -> tuple[int, int] | None:
     indices = [
         idx
@@ -133,11 +136,11 @@ def _center_member_span(
     return indices[0], indices[-1]
 
 
-def _bi_overlaps_center(bi: Bi, center: Zhongshu) -> bool:
+def _bi_overlaps_center(bi: TrendUnit, center: Zhongshu) -> bool:
     return bi.high >= center.zd and bi.low <= center.zg
 
 
-def _bi_leaves_center(bi: Bi, center: Zhongshu, direction: str) -> bool:
+def _bi_leaves_center(bi: TrendUnit, center: Zhongshu, direction: str) -> bool:
     if bi.direction != direction:
         return False
     if direction == "down":
@@ -146,11 +149,11 @@ def _bi_leaves_center(bi: Bi, center: Zhongshu, direction: str) -> bool:
 
 
 def _trend_leg_before_center(
-    bis: list[Bi],
+    bis: list[TrendUnit],
     zhongshus: list[Zhongshu],
     center_idx: int,
     direction: str,
-) -> list[Bi]:
+) -> list[TrendUnit]:
     center_span = _center_member_span(bis, zhongshus[center_idx])
     if center_span is None:
         return []
@@ -176,10 +179,10 @@ def _trend_leg_before_center(
 
 
 def _trend_leg_after_center(
-    bis: list[Bi],
+    bis: list[TrendUnit],
     zhongshus: list[Zhongshu],
     center_idx: int,
-) -> list[Bi]:
+) -> list[TrendUnit]:
     center_span = _center_member_span(bis, zhongshus[center_idx])
     if center_span is None:
         return []
@@ -198,10 +201,17 @@ def _trend_leg_after_center(
 
 
 def _find_trend_segments(
-    bis: list[Bi],
+    bis: list[TrendUnit],
     zhongshus: list[Zhongshu],
     direction: str,
-) -> tuple[list[Bi], list[Bi], list[Bi], list[Bi], Zhongshu, Zhongshu] | None:
+) -> tuple[
+    list[TrendUnit],
+    list[TrendUnit],
+    list[TrendUnit],
+    list[TrendUnit],
+    Zhongshu,
+    Zhongshu,
+] | None:
     """Try to identify a+A+b+B+c structure.
 
     For a confirmed downtrend direction="down":
@@ -233,12 +243,43 @@ def _find_trend_segments(
     return None
 
 
+def _completed_third_class_return(
+    c_window: list[TrendUnit],
+    center: Zhongshu,
+    direction: str,
+) -> TrendUnit | None:
+    """Require C to contain a completed departure and completed first return."""
+    if len(c_window) < 2:
+        return None
+
+    return_direction = "down" if direction == "up" else "up"
+    departure_seen = False
+    for item in c_window:
+        if item.status != "confirmed":
+            continue
+        if not departure_seen:
+            if not _bi_leaves_center(item, center, direction):
+                continue
+            departure_seen = True
+            continue
+        if item.direction == direction:
+            continue
+        if item.direction != return_direction:
+            continue
+        if direction == "up":
+            return item if item.low >= center.zg else None
+        return item if item.high <= center.zd else None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main detection
 # ---------------------------------------------------------------------------
 
 
-def _latest_pair_same_direction(bis: list[Bi], direction: str) -> tuple[Bi, Bi] | None:
+def _latest_pair_same_direction(
+    bis: list[TrendUnit], direction: str
+) -> tuple[TrendUnit, TrendUnit] | None:
     seq = [item for item in bis if item.direction == direction]
     if len(seq) < 2:
         return None
@@ -246,10 +287,10 @@ def _latest_pair_same_direction(bis: list[Bi], direction: str) -> tuple[Bi, Bi] 
 
 
 def _latest_consolidation_departure_pair(
-    bis: list[Bi],
+    bis: list[TrendUnit],
     center: Zhongshu,
     direction: str,
-) -> tuple[Bi, Bi] | None:
+) -> tuple[TrendUnit, TrendUnit] | None:
     center_confirmed_at = center.origin_available_time or center.available_time
     confirmed = [
         item
@@ -282,7 +323,7 @@ def _latest_consolidation_departure_pair(
 def _build_candidate(
     direction: str,
     mode: str,
-    cur_bi: Bi,
+    cur_bi: TrendUnit,
     weaken_ratio: float,
     anchor_center: Zhongshu,
     level: int = 0,
@@ -291,7 +332,7 @@ def _build_candidate(
     if direction == "down":
         if mode == "trend":
             signal_type = "B1"
-            trigger = "主级别向下走势创新低但MACD柱子面积衰减（背驰候选）"
+            trigger = "主级别向下趋势满足结构前提，且MACD同向柱面积C严格小于A"
             invalid_if = f"价格继续跌破{cur_bi.end_price:.2f}并延续下行"
         else:
             signal_type = None
@@ -300,7 +341,7 @@ def _build_candidate(
     else:
         if mode == "trend":
             signal_type = "S1"
-            trigger = "主级别向上走势创新高但MACD柱子面积衰减（背驰候选）"
+            trigger = "主级别向上趋势满足结构前提，且MACD同向柱面积C严格小于A"
             invalid_if = f"价格继续突破{cur_bi.end_price:.2f}并延续上行"
         else:
             signal_type = None
@@ -338,7 +379,7 @@ def _candidate_signal_type(candidate: DivergenceCandidate) -> SignalType | None:
 
 
 def detect_divergence_candidates(
-    bis: list[Bi],
+    bis: list[TrendUnit],
     zhongshu_count: int,
     trend_type: TrendType,
     macd: list[MACDPoint],
@@ -346,6 +387,8 @@ def detect_divergence_candidates(
     zhongshus: list[Zhongshu] | None = None,
     include_consolidation_divergence_hint: bool = True,
     consolidation_anchor: Zhongshu | None = None,
+    require_completed_third_class: bool = False,
+    structure_level: int = 0,
 ) -> list[DivergenceCandidate]:
     """Detect trend divergence and consolidation divergence.
 
@@ -375,6 +418,14 @@ def detect_divergence_candidates(
             if result is not None:
                 a_window, c_window, a_dir_bis, c_dir_bis, A_zs, B_zs = result
 
+                third_class_return = _completed_third_class_return(
+                    c_window,
+                    B_zs,
+                    direction,
+                )
+                if require_completed_third_class and third_class_return is None:
+                    continue
+
                 # Precondition: c must create new extreme beyond a
                 if direction == "down":
                     a_extreme = min(bi.end_price for bi in a_dir_bis)
@@ -386,8 +437,10 @@ def detect_divergence_candidates(
                     price_new_extreme = c_extreme > a_extreme
 
                 if price_new_extreme:
-                    # Zero-axis pullback check in the gap (B region)
-                    pullback_ok = _zero_axis_pullback(
+                    # Lesson 24 says the intervening center *generally*
+                    # pulls DIF/DEA toward zero.  Strict recursive mode uses
+                    # no invented "near zero" percentage as a hard gate.
+                    pullback_ok = threshold <= 0 or _zero_axis_pullback(
                         macd, A_zs.available_time, B_zs.available_time
                     )
 
@@ -400,20 +453,27 @@ def detect_divergence_candidates(
                             macd, B_zs.available_time, c_window[-1].available_time, direction
                         )
 
-                        if a_area > 0:
+                        if a_area > 0 and c_area < a_area:
                             weaken = (a_area - c_area) / a_area
-                            if weaken >= threshold:
+                            if threshold <= 0 or weaken >= threshold:
                                 cur_bi = c_dir_bis[-1]
-                                out.append(
-                                    _build_candidate(
-                                        direction,
-                                        "trend",
-                                        cur_bi,
-                                        weaken,
-                                        B_zs,
-                                        level=0,
-                                    )
+                                candidate = _build_candidate(
+                                    direction,
+                                    "trend",
+                                    cur_bi,
+                                    weaken,
+                                    B_zs,
+                                    level=structure_level,
                                 )
+                                if (
+                                    require_completed_third_class
+                                    and third_class_return is not None
+                                ):
+                                    candidate.available_time = max(
+                                        candidate.available_time,
+                                        third_class_return.available_time,
+                                    )
+                                out.append(candidate)
                                 continue  # found trend divergence, skip fallback
 
         if not include_consolidation_divergence_hint:
@@ -464,7 +524,7 @@ def detect_divergence_candidates(
                 cur_bi,
                 weaken_ratio,
                 center,
-                level=0,
+                level=structure_level,
                 outcome=outcome,
             )
         )

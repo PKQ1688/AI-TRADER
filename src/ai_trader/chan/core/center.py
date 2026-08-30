@@ -16,6 +16,8 @@ CenterRelation = Literal[
 def _build_center_from_three_segments(
     s1: Segment, s2: Segment, s3: Segment
 ) -> Zhongshu | None:
+    if any(item.status != "confirmed" for item in (s1, s2, s3)):
+        return None
     zd = max(s1.low, s2.low, s3.low)
     zg = min(s1.high, s2.high, s3.high)
     if zd > zg:
@@ -43,6 +45,8 @@ def _build_center_from_three_segments(
 
 def _build_center_from_three_bis(b1: Bi, b2: Bi, b3: Bi) -> Zhongshu | None:
     """Build a zhongshu from three consecutive bis (the minimal level)."""
+    if any(item.status != "confirmed" for item in (b1, b2, b3)):
+        return None
     zd = max(b1.low, b2.low, b3.low)
     zg = min(b1.high, b2.high, b3.high)
     if zd > zg:
@@ -82,6 +86,18 @@ def _wave_ranges_touch(prev: Zhongshu, cur: Zhongshu) -> bool:
     return max(prev.dd, cur.dd) <= min(prev.gg, cur.gg)
 
 
+def _extend_with_z_move(center: Zhongshu, move: Bi | Segment) -> None:
+    """Extend a center with the next completed same-direction Z move."""
+    center.evolution = "extension"
+    center.gg = max(center.gg, move.high)
+    center.dd = min(center.dd, move.low)
+    center.g = min(center.g, move.high)
+    center.d = max(center.d, move.low)
+    center.end_index = move.end_index
+    center.event_time = move.event_time
+    center.available_time = max(center.available_time, move.available_time)
+
+
 def classify_center_relation(prev: Zhongshu, cur: Zhongshu) -> CenterRelation:
     """Classify the relation between two consecutive same-level centers.
 
@@ -116,8 +132,10 @@ def _evolve_and_append(out: list[Zhongshu], candidate: Zhongshu) -> None:
 
     # Case 1: 中枢区间 overlap → extension (same center continues)
     if relation == "extension":
-        prev.zd = max(prev.zd, candidate.zd)
-        prev.zg = min(prev.zg, candidate.zg)
+        # [ZD, ZG] is fixed by the first three completed sub-level moves.
+        # Later overlapping moves extend the same center, but they do not
+        # redefine (shrink) its core interval.  Only the surrounding range
+        # statistics and the temporal boundary evolve.
         prev.gg = max(prev.gg, candidate.gg)
         prev.dd = min(prev.dd, candidate.dd)
         prev.g = min(prev.g, candidate.g)
@@ -162,13 +180,39 @@ def build_zhongshus(segments: list[Segment]) -> list[Zhongshu]:
     if len(segments) < 3:
         return out
 
-    for i in range(2, len(segments)):
+    i = 0
+    while i + 2 < len(segments):
         candidate = _build_center_from_three_segments(
-            segments[i - 2], segments[i - 1], segments[i]
+            segments[i], segments[i + 1], segments[i + 2]
         )
         if candidate is None:
+            i += 1
             continue
+
+        # Z1 and Z2 are the first and third moves.  Later Z moves therefore
+        # occur at i+4, i+6, ...; the intervening reverse move alone cannot
+        # confirm a center extension.
+        j = i + 4
+        while j < len(segments):
+            z_move = segments[j]
+            if z_move.status != "confirmed":
+                break
+            if z_move.low > candidate.zg or z_move.high < candidate.zd:
+                break
+            _extend_with_z_move(candidate, z_move)
+            j += 2
+
         _evolve_and_append(out, candidate)
+
+        if j < len(segments):
+            # The non-overlapping Z move starts the search for a new center;
+            # the reverse move immediately before it is the connector out of
+            # the completed center.  Reusing the last in-center Z move would
+            # force consecutive centers to share a source move, making their
+            # wave ranges touch by construction and making a trend impossible.
+            i = j
+        else:
+            break
 
     return out
 
@@ -191,30 +235,25 @@ def build_zhongshus_from_bis(bis: list[Bi]) -> list[Zhongshu]:
             i += 1
             continue
 
-        # Keep extending while the next bi overlaps the current center.
-        # Zn 超过 9 的监视规则属于震荡监控层，不应在中枢生成层截断
-        # 正在延伸的中枢。
-        j = i + 3
+        # Z1 and Z2 are bis[i] and bis[i+2].  Only the next completed
+        # same-direction move (i+4, i+6, ...) can confirm extension; the
+        # intervening reverse bi is merely the connector.
+        j = i + 4
         while j < len(bis):
-            bi = bis[j]
-            if bi.low <= candidate.zg and bi.high >= candidate.zd:
-                # This bi overlaps the center → extend
-                candidate.zd = max(candidate.zd, bi.low)
-                candidate.zg = min(candidate.zg, bi.high)
-                candidate.gg = max(candidate.gg, bi.high)
-                candidate.dd = min(candidate.dd, bi.low)
-                candidate.g = min(candidate.g, bi.high)
-                candidate.d = max(candidate.d, bi.low)
-                candidate.end_index = bi.end_index
-                candidate.event_time = bi.event_time
-                candidate.available_time = max(
-                    candidate.available_time, bi.available_time
-                )
-                j += 1
-            else:
+            z_move = bis[j]
+            if z_move.status != "confirmed":
                 break
+            if z_move.low > candidate.zg or z_move.high < candidate.zd:
+                break
+            _extend_with_z_move(candidate, z_move)
+            j += 2
 
         _evolve_and_append(out, candidate)
-        i = j  # skip past the consumed bis
+        if j < len(bis):
+            # Start the next-center search at the first non-overlapping Z bi;
+            # the preceding reverse bi is the connector between centers.
+            i = j
+        else:
+            break
 
     return out

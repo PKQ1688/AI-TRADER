@@ -6,7 +6,11 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ai_trader.chan.core.center import build_zhongshus, build_zhongshus_from_bis
+from ai_trader.chan.core.center import (
+    build_zhongshus,
+    build_zhongshus_from_bis,
+    classify_center_relation,
+)
 from ai_trader.chan.core.buy_sell_points import decide_action, generate_signals
 from ai_trader.chan.config import get_chan_config
 from ai_trader.chan.core.divergence import (
@@ -94,6 +98,17 @@ class ChanCoreRulesTest(unittest.TestCase):
             anchor_center_available_time=anchor_center_available_time,
         )
 
+    def test_strict_kline8_profile_uses_fixed_clock_and_two_sided_execution(
+        self,
+    ) -> None:
+        cfg = get_chan_config("strict_kline8")
+
+        self.assertEqual(cfg.mode, "strict_kline8")
+        self.assertEqual(cfg.structure_construction, "clock_approximation")
+        self.assertEqual(cfg.execution_buy_types, ("B2", "B3"))
+        self.assertEqual(cfg.execution_sell_types, ("S2", "S3"))
+        self.assertFalse(cfg.require_sub_interval_confirmation)
+
     def test_merge_inclusions_strict_sequence(self) -> None:
         bars = [
             Bar(time=self._t(0), open=8, high=10, low=5, close=9),
@@ -159,7 +174,12 @@ class ChanCoreRulesTest(unittest.TestCase):
         seg_yes = build_segments(bis_with_confirm, require_case2_confirmation=True)
         self.assertTrue(seg_yes)
         self.assertEqual(seg_yes[0].status, "confirmed")
-        self.assertEqual(seg_yes[0].end_index, bis_with_confirm[3].end_index)
+        self.assertEqual(seg_yes[0].end_index, bis_with_confirm[3].start_index)
+        self.assertEqual(seg_yes[0].event_time, bis_with_confirm[2].event_time)
+        self.assertEqual(
+            seg_yes[0].available_time,
+            bis_with_confirm[10].available_time,
+        )
 
     def test_segment_requires_initial_three_bi_overlap(self) -> None:
         bis = [
@@ -196,7 +216,11 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertGreaterEqual(len(segments), 2)
         for i in range(1, len(segments)):
             self.assertNotEqual(segments[i - 1].direction, segments[i].direction)
-            self.assertEqual(segments[i - 1].end_index - 1, segments[i].start_index)
+            self.assertEqual(segments[i - 1].end_index, segments[i].start_index)
+            self.assertLessEqual(
+                segments[i - 1].available_time,
+                segments[i].available_time,
+            )
 
     def test_segment_keeps_opposite_provisional_when_boundary_lacks_overlap(
         self,
@@ -275,7 +299,7 @@ class ChanCoreRulesTest(unittest.TestCase):
                 for item in segments
             ],
             [
-                ("up", 114, 141, "confirmed"),
+                ("up", 114, 134, "confirmed"),
                 ("down", 134, 179, "provisional"),
             ],
         )
@@ -357,6 +381,24 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertEqual(b2.anchor_center_start_index, 0)
         self.assertEqual(b2.anchor_center_end_index, 2)
         self.assertEqual(b2.anchor_center_available_time, self._t(2))
+
+    def test_b2_allows_first_pullback_to_touch_b1_low(self) -> None:
+        signals = generate_signals(
+            divergence_candidates=[self._mk_divergence("B1", 2, 95.0)],
+            bis_sub=[
+                self._mk_bi(3, "up", 96, 103),
+                self._mk_bi(4, "down", 103, 95),
+                self._mk_bi(5, "up", 95, 105),
+            ],
+            segments_sub=[],
+            zhongshu_main=None,
+            market_state=MarketState(trend_type="down"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+        )
+
+        self.assertIn("B2", {item.type for item in signals})
 
     def test_b2_not_emitted_after_sub_level_new_center_confirms(self) -> None:
         late_center = Zhongshu(
@@ -460,6 +502,24 @@ class ChanCoreRulesTest(unittest.TestCase):
 
         self.assertNotIn("S2", {item.type for item in signals})
 
+    def test_s2_allows_first_rebound_to_touch_s1_high(self) -> None:
+        signals = generate_signals(
+            divergence_candidates=[self._mk_divergence("S1", 2, 105.0)],
+            bis_sub=[
+                self._mk_bi(3, "down", 104, 97),
+                self._mk_bi(4, "up", 97, 105),
+                self._mk_bi(5, "down", 105, 95),
+            ],
+            segments_sub=[],
+            zhongshu_main=None,
+            market_state=MarketState(trend_type="up"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+        )
+
+        self.assertIn("S2", {item.type for item in signals})
+
     def test_b3_requires_sub_level_departure_and_first_pullback(self) -> None:
         zs = Zhongshu(
             zd=98.0,
@@ -527,7 +587,40 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertEqual(b3.event_time, self._t(4))
         self.assertEqual(b3.available_time, self._t(5))
 
-    def test_b3_bi_context_requires_departure_after_center_end(self) -> None:
+    def test_b3_allows_first_pullback_to_touch_zg(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[],
+            bis_sub=[],
+            segments_sub=[],
+            zhongshu_main=zs,
+            market_state=MarketState(trend_type="up"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+            bis_context=[
+                self._mk_bi(1, "down", 103.0, 99.0),
+                self._mk_bi(2, "up", 100.0, 108.0),
+                self._mk_bi(3, "down", 107.0, 102.0),
+                self._mk_bi(4, "up", 102.0, 112.0),
+            ],
+        )
+
+        self.assertIn("B3", {item.type for item in signals})
+
+    def test_b3_bi_context_uses_time_not_cross_timeframe_index(self) -> None:
         zs = Zhongshu(
             zd=98.0,
             zg=102.0,
@@ -539,6 +632,38 @@ class ChanCoreRulesTest(unittest.TestCase):
             end_index=4,
             event_time=self._t(2),
             available_time=self._t(2),
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[],
+            bis_sub=[],
+            segments_sub=[],
+            zhongshu_main=zs,
+            market_state=MarketState(trend_type="up"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+            bis_context=[
+                self._mk_bi(3, "up", 100.0, 108.0),
+                self._mk_bi(4, "down", 107.0, 103.0),
+                self._mk_bi(5, "up", 104.0, 112.0),
+            ],
+        )
+
+        self.assertIn("B3", {item.type for item in signals})
+
+    def test_b3_bi_context_requires_departure_after_center_confirmation(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=4,
+            event_time=self._t(2),
+            available_time=self._t(4),
         )
 
         signals = generate_signals(
@@ -1023,6 +1148,7 @@ class ChanCoreRulesTest(unittest.TestCase):
             action=Action(decision="sell", reason="sell"),
             risk=Risk(conflict_level="low", notes=""),
             cn_summary="sell",
+            buy_sell_points=[SimpleNamespace(type="S3")],
         )
 
         seen_signal_keys: set[tuple] = set()
@@ -1034,6 +1160,7 @@ class ChanCoreRulesTest(unittest.TestCase):
         )
         self.assertEqual(first.action.decision, "sell")
         self.assertEqual(len(first.signals), 1)
+        self.assertEqual(len(first.buy_sell_points), 1)
         self.assertEqual(len(seen_signal_keys), 1)
 
         second = suppress_seen_signal_events(
@@ -1043,6 +1170,7 @@ class ChanCoreRulesTest(unittest.TestCase):
             0.60,
         )
         self.assertFalse(second.signals)
+        self.assertFalse(second.buy_sell_points)
         self.assertEqual(second.action.decision, "hold")
 
     def test_suppress_seen_signal_events_dedupes_b3s3_by_center(self) -> None:
@@ -1189,6 +1317,70 @@ class ChanCoreRulesTest(unittest.TestCase):
         )
         self.assertFalse(second.signals)
         self.assertEqual(second.action.decision, "hold")
+
+    def test_turning_guard_is_not_invalidated_by_touching_boundary(self) -> None:
+        first_signal = Signal(
+            type="B1",
+            level="main",
+            trigger="b1",
+            invalid_if="invalid",
+            confidence=0.85,
+            event_time=self._t(5),
+            available_time=self._t(6),
+            invalid_price=100.0,
+            anchor_center_start_index=7,
+            anchor_center_end_index=9,
+        )
+        repeat_signal = Signal(
+            type="B1",
+            level="main",
+            trigger="b1",
+            invalid_if="invalid",
+            confidence=0.85,
+            event_time=self._t(7),
+            available_time=self._t(8),
+            invalid_price=100.0,
+            anchor_center_start_index=7,
+            anchor_center_end_index=9,
+        )
+
+        def decision(signal: Signal) -> SignalDecision:
+            return SignalDecision(
+                exchange="binance",
+                symbol="BTC/USDT",
+                timeframe_main="4h",
+                timeframe_sub="1h",
+                data_quality=DataQuality(status="ok", notes=""),
+                market_state=MarketState(trend_type="down"),
+                signals=[signal],
+                action=Action(decision="buy", reason="buy"),
+                risk=Risk(conflict_level="low", notes=""),
+                cn_summary="buy",
+            )
+
+        seen_signal_keys: set[tuple] = set()
+        guards: dict[tuple, dict[str, object]] = {}
+        suppress_seen_signal_events(
+            decision(first_signal),
+            seen_signal_keys,
+            get_chan_config("orthodox_chan"),
+            0.60,
+            active_turning_guards=guards,
+            asof_low=101.0,
+            asof_high=110.0,
+        )
+        repeated = suppress_seen_signal_events(
+            decision(repeat_signal),
+            seen_signal_keys,
+            get_chan_config("orthodox_chan"),
+            0.60,
+            active_turning_guards=guards,
+            asof_low=100.0,
+            asof_high=110.0,
+        )
+
+        self.assertFalse(repeated.signals)
+        self.assertEqual(repeated.action.decision, "hold")
 
     def test_suppress_seen_signal_events_rearms_b1_after_invalidation(
         self,
@@ -1673,6 +1865,68 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertEqual(divergence[0].anchor_center_start_index, 8)
         self.assertEqual(divergence[0].anchor_center_end_index, 11)
         self.assertEqual(divergence[0].anchor_center_available_time, self._t(11))
+
+        strict_without_zero_pullback = detect_divergence_candidates(
+            bis=bis,
+            zhongshu_count=2,
+            trend_type="down",
+            macd=[
+                MACDPoint(
+                    time=self._t(1), dif=-4.0, dea=-3.0, hist=-10.0
+                ),
+                MACDPoint(
+                    time=self._t(13), dif=-1.5, dea=-1.0, hist=-9.99
+                ),
+            ],
+            threshold=0.0,
+            zhongshus=zhongshus,
+        )
+        self.assertEqual(len(strict_without_zero_pullback), 1)
+
+        strict_equal_area = detect_divergence_candidates(
+            bis=bis,
+            zhongshu_count=2,
+            trend_type="down",
+            macd=[
+                MACDPoint(
+                    time=self._t(1), dif=-4.0, dea=-3.0, hist=-10.0
+                ),
+                MACDPoint(
+                    time=self._t(13), dif=-1.5, dea=-1.0, hist=-10.0
+                ),
+            ],
+            threshold=0.0,
+            zhongshus=zhongshus,
+        )
+        self.assertEqual(strict_equal_area, [])
+
+        strict_requires_third_class = detect_divergence_candidates(
+            bis=bis,
+            zhongshu_count=2,
+            trend_type="down",
+            macd=macd,
+            threshold=0.0,
+            zhongshus=zhongshus,
+            require_completed_third_class=True,
+        )
+        self.assertEqual(strict_requires_third_class, [])
+
+        c_with_third_class = bis[:-1] + [
+            self._mk_bi(13, "up", 84, 89),
+        ]
+        strict_complete = detect_divergence_candidates(
+            bis=c_with_third_class,
+            zhongshu_count=2,
+            trend_type="down",
+            macd=macd,
+            threshold=0.0,
+            zhongshus=zhongshus,
+            require_completed_third_class=True,
+            structure_level=2,
+        )
+        self.assertEqual(len(strict_complete), 1)
+        self.assertEqual(strict_complete[0].level, 2)
+        self.assertEqual(strict_complete[0].available_time, self._t(14))
 
     def test_trend_divergence_rejects_center_expansion_pair(self) -> None:
         bis = [
@@ -2432,6 +2686,38 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertEqual(state.walk_type, "consolidation")
         self.assertEqual(state.phase, "transitional")
 
+    def test_strict_kline8_executes_confirmed_third_class_points_in_transition(
+        self,
+    ) -> None:
+        cfg = get_chan_config("strict_kline8")
+        state = MarketState(trend_type="range", phase="transitional")
+        b3 = Signal(
+            type="B3",
+            level="main",
+            trigger="confirmed b3",
+            invalid_if="below center",
+            confidence=0.68,
+            event_time=self._t(8),
+            available_time=self._t(9),
+            invalid_price=100.0,
+        )
+        s3 = Signal(
+            type="S3",
+            level="main",
+            trigger="confirmed s3",
+            invalid_if="above center",
+            confidence=0.68,
+            event_time=self._t(8),
+            available_time=self._t(9),
+            invalid_price=110.0,
+        )
+
+        buy_action, _ = decide_action([b3], state, "low", 0.60, cfg)
+        sell_action, _ = decide_action([s3], state, "low", 0.60, cfg)
+
+        self.assertEqual(buy_action.decision, "buy")
+        self.assertEqual(sell_action.decision, "sell")
+
     def test_transitional_wait_uses_zn_breakout_note_without_b3(self) -> None:
         action, summary = decide_action(
             signals=[],
@@ -3002,20 +3288,50 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertEqual(bis[0].end_index, bis[1].start_index)
         self.assertEqual(bis[0].end_price, bis[1].start_price)
         self.assertEqual(bis[0].event_time, self._t(10))
-        self.assertEqual(bis[0].available_time, self._t(11))
+        self.assertEqual(bis[0].available_time, self._t(15))
+        self.assertEqual(bis[0].status, "confirmed")
+        self.assertEqual(bis[1].status, "provisional")
 
-    def test_bi_zhongshu_extension_shrinks_overlap_range(self) -> None:
+    def test_provisional_last_bi_cannot_form_confirmed_center(self) -> None:
+        bis = [
+            self._mk_bi(0, "up", 10, 20),
+            self._mk_bi(1, "down", 20, 14),
+            self._mk_bi(2, "up", 14, 24),
+        ]
+        bis[-1].status = "provisional"
+
+        self.assertEqual(build_zhongshus_from_bis(bis), [])
+
+    def test_bi_zhongshu_extension_preserves_formation_range(self) -> None:
         zhongshus = build_zhongshus_from_bis(
             [
                 self._mk_bi(0, "up", 10, 20),
                 self._mk_bi(1, "down", 22, 14),
                 self._mk_bi(2, "up", 15, 24),
                 self._mk_bi(3, "down", 18, 16),
+                self._mk_bi(4, "up", 16, 25),
             ]
         )
 
         self.assertEqual(len(zhongshus), 1)
-        self.assertEqual((zhongshus[0].zd, zhongshus[0].zg), (16, 18))
+        self.assertEqual((zhongshus[0].zd, zhongshus[0].zg), (15, 20))
+        self.assertEqual((zhongshus[0].dd, zhongshus[0].gg), (10, 25))
+        self.assertEqual(zhongshus[0].end_index, 5)
+        self.assertEqual(zhongshus[0].available_time, self._t(5))
+
+    def test_bi_zhongshu_does_not_extend_on_reverse_connector_alone(self) -> None:
+        zhongshus = build_zhongshus_from_bis(
+            [
+                self._mk_bi(0, "up", 10, 20),
+                self._mk_bi(1, "down", 20, 14),
+                self._mk_bi(2, "up", 14, 24),
+                self._mk_bi(3, "down", 24, 16),
+            ]
+        )
+
+        self.assertEqual(len(zhongshus), 1)
+        self.assertEqual(zhongshus[0].end_index, 3)
+        self.assertEqual(zhongshus[0].available_time, self._t(3))
 
     def test_bi_zhongshu_extension_has_no_artificial_cap(self) -> None:
         zhongshus = build_zhongshus_from_bis(
@@ -3035,7 +3351,7 @@ class ChanCoreRulesTest(unittest.TestCase):
         )
 
         self.assertEqual(len(zhongshus), 1)
-        self.assertEqual((zhongshus[0].zd, zhongshus[0].zg), (17.6, 17.8))
+        self.assertEqual((zhongshus[0].zd, zhongshus[0].zg), (15.0, 19.0))
         self.assertEqual(zhongshus[0].end_index, 11)
         self.assertEqual(zhongshus[0].available_time, self._t(11))
 
@@ -3048,18 +3364,38 @@ class ChanCoreRulesTest(unittest.TestCase):
             self._mk_segment(4, "up", 111, 102),
             self._mk_segment(5, "down", 113, 103),
             self._mk_segment(6, "up", 116, 109),
+            self._mk_segment(7, "down", 117, 110),
+            self._mk_segment(8, "up", 118, 109.5),
         ]
 
         zhongshus = build_zhongshus(segments)
-        # After extension the first center covers segs 0-5. The last
-        # candidate (segs 4-6) does not overlap the center interval but
+        # After extension the first center is confirmed through seg 4. The
+        # independent candidate (segs 6-8) does not overlap the center but
         # its wave range touches, so it triggers level expansion. We keep
         # the same-level center sequence and mark the newer center as
         # "expansion" instead of collapsing everything into one giant center.
         self.assertEqual(len(zhongshus), 2)
         self.assertEqual(zhongshus[0].evolution, "extension")
         self.assertEqual(zhongshus[1].evolution, "expansion")
-        self.assertEqual(zhongshus[1].start_index, 4)
+        self.assertEqual(zhongshus[1].start_index, 6)
+
+    def test_disjoint_zhongshus_can_form_uptrend(self) -> None:
+        segments = [
+            self._mk_segment(0, "up", 110, 100),
+            self._mk_segment(1, "down", 108, 98),
+            self._mk_segment(2, "up", 109, 99),
+            self._mk_segment(3, "down", 112, 101),
+            self._mk_segment(4, "up", 111, 102),
+            self._mk_segment(5, "down", 113, 103),
+            self._mk_segment(6, "up", 116, 112),
+            self._mk_segment(7, "down", 117, 113),
+            self._mk_segment(8, "up", 118, 112.5),
+        ]
+
+        zhongshus = build_zhongshus(segments)
+
+        self.assertEqual(len(zhongshus), 2)
+        self.assertEqual(classify_center_relation(*zhongshus), "trend_up")
 
     def test_conflict_high_forces_wait(self) -> None:
         t0 = self._t(0)
@@ -3455,7 +3791,40 @@ class ChanCoreRulesTest(unittest.TestCase):
         self.assertEqual(s3.event_time, self._t(4))
         self.assertEqual(s3.available_time, self._t(5))
 
-    def test_s3_bi_context_requires_departure_after_center_end(self) -> None:
+    def test_s3_allows_first_rebound_to_touch_zd(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=2,
+            event_time=self._t(2),
+            available_time=self._t(2),
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[],
+            bis_sub=[],
+            segments_sub=[],
+            zhongshu_main=zs,
+            market_state=MarketState(trend_type="down"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+            bis_context=[
+                self._mk_bi(1, "up", 99.0, 103.0),
+                self._mk_bi(2, "down", 101.0, 96.0),
+                self._mk_bi(3, "up", 93.0, 98.0),
+                self._mk_bi(4, "down", 98.0, 90.0),
+            ],
+        )
+
+        self.assertIn("S3", {item.type for item in signals})
+
+    def test_s3_bi_context_uses_time_not_cross_timeframe_index(self) -> None:
         zs = Zhongshu(
             zd=98.0,
             zg=102.0,
@@ -3467,6 +3836,38 @@ class ChanCoreRulesTest(unittest.TestCase):
             end_index=4,
             event_time=self._t(2),
             available_time=self._t(2),
+        )
+
+        signals = generate_signals(
+            divergence_candidates=[],
+            bis_sub=[],
+            segments_sub=[],
+            zhongshu_main=zs,
+            market_state=MarketState(trend_type="down"),
+            macd_missing=False,
+            missing_macd_penalty=0.10,
+            transitional_confidence_cap=0.60,
+            bis_context=[
+                self._mk_bi(3, "down", 101.0, 96.0),
+                self._mk_bi(4, "up", 93.0, 97.0),
+                self._mk_bi(5, "down", 95.0, 90.0),
+            ],
+        )
+
+        self.assertIn("S3", {item.type for item in signals})
+
+    def test_s3_bi_context_requires_departure_after_center_confirmation(self) -> None:
+        zs = Zhongshu(
+            zd=98.0,
+            zg=102.0,
+            gg=110.0,
+            dd=92.0,
+            g=102.0,
+            d=98.0,
+            start_index=0,
+            end_index=4,
+            event_time=self._t(2),
+            available_time=self._t(4),
         )
 
         signals = generate_signals(

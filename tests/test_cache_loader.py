@@ -6,8 +6,10 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from ai_trader.data import cache_path_for, load_ohlcv
+from ai_trader.data.binance_ohlcv import _fetch_with_binance_rest_ms
 from tests.test_utils import make_synthetic_bars
 
 
@@ -67,6 +69,42 @@ class CacheLoaderTest(unittest.TestCase):
                 start_utc=query_start.isoformat().replace("+00:00", "Z"),
                 end_utc=query_end.isoformat().replace("+00:00", "Z"),
             )
+
+    def test_usdm_market_uses_futures_rest_endpoint(self) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = [
+            [
+                1_700_000_000_000,
+                "100.0",
+                "102.0",
+                "99.0",
+                "101.0",
+                "12.5",
+            ]
+        ]
+
+        with patch("requests.get", return_value=response) as request_get:
+            bars = _fetch_with_binance_rest_ms(
+                symbol="BTC/USDT",
+                timeframe="1m",
+                start_ms=1_700_000_000_000,
+                end_ms=1_700_000_000_000,
+                market="usdm",
+            )
+
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(
+            request_get.call_args.args[0],
+            "https://fapi.binance.com/fapi/v1/klines",
+        )
+
+    def test_spot_and_usdm_caches_are_separate(self) -> None:
+        spot = cache_path_for("binance", "BTC/USDT", "1m")
+        perpetual = cache_path_for("binanceusdm", "BTC/USDT", "1m")
+
+        self.assertNotEqual(spot, perpetual)
+        self.assertIn("binanceusdm", perpetual.parts)
 
 
 if __name__ == "__main__":

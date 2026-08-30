@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from argparse import ArgumentParser
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from _script_utils import ensure_src_on_path, write_csv_rows
@@ -13,7 +13,7 @@ ensure_src_on_path()
 
 from ai_trader.backtest.engine import run_backtest, run_sensitivity
 from ai_trader.data.binance_ohlcv import load_ohlcv
-from ai_trader.types import BacktestConfig
+from ai_trader.types import BacktestConfig, iso_utc, parse_utc_time
 
 
 def main() -> None:
@@ -56,8 +56,24 @@ def main() -> None:
         check_signal_repaint=args.repaint_check,
     )
 
-    bars_main = load_ohlcv(config.exchange, config.symbol, config.timeframe_main, config.start_utc, config.end_utc)
-    bars_sub = load_ohlcv(config.exchange, config.symbol, config.timeframe_sub, config.start_utc, config.end_utc)
+    load_start_utc = iso_utc(
+        parse_utc_time(config.start_utc)
+        - timedelta(days=config.history_prefetch_days)
+    )
+    bars_main = load_ohlcv(
+        config.exchange,
+        config.symbol,
+        config.timeframe_main,
+        load_start_utc,
+        config.end_utc,
+    )
+    bars_sub = load_ohlcv(
+        config.exchange,
+        config.symbol,
+        config.timeframe_sub,
+        load_start_utc,
+        config.end_utc,
+    )
 
     base_report = run_backtest(config, bars_main=bars_main, bars_sub=bars_sub)
     cost_reports = {"base": base_report}

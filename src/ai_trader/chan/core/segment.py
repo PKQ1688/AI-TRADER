@@ -105,7 +105,7 @@ def _feature_peak_index(mid: FeatureBar, bis: list[Bi], want: str) -> int:
     return peak_idx
 
 
-def _reverse_confirm(bis: list[Bi], peak_idx: int, seg_dir: str) -> bool:
+def _reverse_confirm(bis: list[Bi], peak_idx: int, seg_dir: str) -> int | None:
     reverse_seg_dir = "down" if seg_dir == "up" else "up"
     feature_dir = seg_dir
     feature = [
@@ -114,18 +114,21 @@ def _reverse_confirm(bis: list[Bi], peak_idx: int, seg_dir: str) -> bool:
         if i > peak_idx and bi.direction == feature_dir
     ]
     if len(feature) < 3:
-        return False
+        return None
 
     std = _merge_feature_bars(feature)
     want = "bottom" if reverse_seg_dir == "down" else "top"
-    return _find_feature_fractal(std, want) is not None
+    fx_idx = _find_feature_fractal(std, want)
+    if fx_idx is None:
+        return None
+    return max(std[fx_idx + 1].source_idx)
 
 
 def _find_segment_end(
     bis: list[Bi],
     start_idx: int,
     require_case2_confirmation: bool,
-) -> tuple[int | None, str | None]:
+) -> tuple[int | None, str | None, int | None]:
     seg_dir = bis[start_idx].direction
     feature_dir = "down" if seg_dir == "up" else "up"
     want_fx = "top" if seg_dir == "up" else "bottom"
@@ -152,12 +155,18 @@ def _find_segment_end(
 
         has_gap = not _overlap(first.low, first.high, second.low, second.high)
         if not has_gap:
-            return peak_idx, "case1"
+            confirmation_idx = max(std[fx_idx + 1].source_idx)
+            return peak_idx, "case1", confirmation_idx
 
-        if not require_case2_confirmation or _reverse_confirm(bis, peak_idx, seg_dir):
-            return peak_idx, "case2"
+        if not require_case2_confirmation:
+            confirmation_idx = max(std[fx_idx + 1].source_idx)
+            return peak_idx, "case2", confirmation_idx
 
-    return None, None
+        reverse_confirmation_idx = _reverse_confirm(bis, peak_idx, seg_dir)
+        if reverse_confirmation_idx is not None:
+            return peak_idx, "case2", reverse_confirmation_idx
+
+    return None, None, None
 
 
 def _provisional_segment(sl: list[Bi]) -> Segment:
@@ -178,6 +187,12 @@ def build_segments(
     bis: list[Bi], require_case2_confirmation: bool = True
 ) -> list[Segment]:
     segments: list[Segment] = []
+    confirmed_prefix: list[Bi] = []
+    for bi in bis:
+        if bi.status != "confirmed":
+            break
+        confirmed_prefix.append(bi)
+    bis = confirmed_prefix
     if len(bis) < 3:
         return segments
 
@@ -193,29 +208,50 @@ def build_segments(
             cursor += 1
             continue
 
-        end_idx, _ = _find_segment_end(bis, cursor, require_case2_confirmation)
-        if end_idx is None or end_idx <= cursor:
+        end_idx, _, confirmation_idx = _find_segment_end(
+            bis, cursor, require_case2_confirmation
+        )
+        if (
+            end_idx is None
+            or confirmation_idx is None
+            or end_idx <= cursor
+        ):
             if not segments and first_unconfirmed_start is None:
                 first_unconfirmed_start = cursor
             cursor += 1
             continue
 
-        sl = bis[cursor : end_idx + 1]
-        last = sl[-1]
+        # The feature-sequence fractal is located at the start of the
+        # opposite-direction bi.  That extreme point, rather than the other
+        # end of the feature bi, is the segment endpoint.  The segment only
+        # becomes available after the right feature element (case 1), or the
+        # reverse feature fractal (case 2), has completed.
+        sl = bis[cursor:end_idx]
+        endpoint_bi = bis[end_idx]
+        confirmation_slice = bis[cursor : confirmation_idx + 1]
+        available_time = max(
+            item.available_time for item in confirmation_slice
+        )
+        if segments:
+            # A reverse segment cannot be known before the shared endpoint
+            # that confirmed its predecessor.  Case-2 confirmation can arrive
+            # later than the reverse segment's own feature fractal, so carry
+            # the predecessor's availability forward to preserve causality.
+            available_time = max(available_time, segments[-1].available_time)
         segments.append(
             Segment(
                 direction=bis[cursor].direction,
                 start_index=sl[0].start_index,
-                end_index=last.end_index,
-                high=max(item.high for item in sl),
-                low=min(item.low for item in sl),
-                event_time=last.event_time,
-                available_time=max(item.available_time for item in sl),
+                end_index=endpoint_bi.start_index,
+                high=max(max(item.high for item in sl), endpoint_bi.start_price),
+                low=min(min(item.low for item in sl), endpoint_bi.start_price),
+                event_time=sl[-1].event_time,
+                available_time=available_time,
                 status="confirmed",
             )
         )
-        # Consecutive segments share the boundary bi; advancing past it can
-        # incorrectly emit multiple same-direction segments.
+        # Consecutive segments share the boundary point.  The feature bi that
+        # starts at that point is the first bi of the reverse segment.
         last_confirmed_end_idx = end_idx
         cursor = end_idx
 

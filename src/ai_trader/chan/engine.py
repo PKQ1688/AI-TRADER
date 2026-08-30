@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 from collections.abc import Sequence
@@ -22,6 +23,7 @@ from ai_trader.chan.core.recursive import build_recursive_levels_from_bis
 from ai_trader.chan.core.segment import build_segments
 from ai_trader.chan.core.stroke import build_bis
 from ai_trader.chan.core.trend_phase import infer_market_state
+from ai_trader.chan.structural import StructuralView
 from ai_trader.indicators import compute_macd
 from ai_trader.types import (
     Action,
@@ -39,6 +41,58 @@ from ai_trader.types import (
 def _bars_until(bars: list[Bar], asof_time) -> list[Bar]:
     asof = parse_utc_time(asof_time)
     return [bar for bar in bars if bar.time <= asof]
+
+
+def _timeframe_seconds(timeframe: str) -> int | None:
+    if len(timeframe) < 2 or not timeframe[:-1].isdigit():
+        return None
+    value = int(timeframe[:-1])
+    if value <= 0:
+        return None
+    multiplier = {
+        "m": 60,
+        "h": 60 * 60,
+        "d": 24 * 60 * 60,
+        "w": 7 * 24 * 60 * 60,
+    }.get(timeframe[-1])
+    if multiplier is None:
+        return None
+    return value * multiplier
+
+
+def _validate_bar_sequence(
+    bars: list[Bar], timeframe: str, label: str
+) -> str | None:
+    step_seconds = _timeframe_seconds(timeframe)
+    if step_seconds is None:
+        return f"{label} 的 timeframe={timeframe!r} 不受支持"
+
+    previous = None
+    for idx, bar in enumerate(bars):
+        prices = (bar.open, bar.high, bar.low, bar.close)
+        if not all(math.isfinite(value) for value in (*prices, bar.volume)):
+            return f"{label}[{idx}] 含 NaN 或无穷值"
+        if any(value <= 0 for value in prices):
+            return f"{label}[{idx}] 含非正价格"
+        if bar.volume < 0:
+            return f"{label}[{idx}] 成交量为负"
+        if bar.high < max(bar.open, bar.close, bar.low):
+            return f"{label}[{idx}] high 低于 open/close/low"
+        if bar.low > min(bar.open, bar.close, bar.high):
+            return f"{label}[{idx}] low 高于 open/close/high"
+
+        if previous is not None:
+            elapsed = int((bar.time - previous.time).total_seconds())
+            if elapsed <= 0:
+                return f"{label}[{idx}] 时间戳重复或未严格递增"
+            if elapsed != step_seconds:
+                return (
+                    f"{label}[{idx - 1}:{idx}] K线不连续："
+                    f"实际间隔={elapsed}s，期望={step_seconds}s"
+                )
+        previous = bar
+
+    return None
 
 
 def _normalize_macd(
@@ -114,6 +168,7 @@ def build_chan_state(
     timeframe_main: str = "4h",
     timeframe_sub: str = "1h",
     chan_config: ChanConfig | None = None,
+    structural_view: StructuralView | None = None,
 ) -> ChanSnapshot:
     cfg = chan_config or get_chan_config("orthodox_chan")
     asof = parse_utc_time(asof_time)
@@ -121,7 +176,46 @@ def build_chan_state(
     raw_main = _bars_until(bars_main, asof)
     raw_sub = _bars_until(bars_sub, asof)
 
-    if len(raw_main) < cfg.min_main_bars or len(raw_sub) < cfg.min_sub_bars:
+    quality_notes: list[str] = []
+    if len(raw_main) < cfg.min_main_bars:
+        quality_notes.append(f"bars_main={len(raw_main)} (<{cfg.min_main_bars})")
+    if len(raw_sub) < cfg.min_sub_bars:
+        quality_notes.append(f"bars_sub={len(raw_sub)} (<{cfg.min_sub_bars})")
+
+    main_error = _validate_bar_sequence(raw_main, timeframe_main, "bars_main")
+    sub_error = _validate_bar_sequence(raw_sub, timeframe_sub, "bars_sub")
+    if main_error is not None:
+        quality_notes.append(main_error)
+    if sub_error is not None:
+        quality_notes.append(sub_error)
+
+    main_step = _timeframe_seconds(timeframe_main)
+    sub_step = _timeframe_seconds(timeframe_sub)
+    if (
+        main_step is not None
+        and sub_step is not None
+        and (sub_step >= main_step or main_step % sub_step != 0)
+    ):
+        quality_notes.append(
+            "timeframe_sub 必须严格小于 timeframe_main，且能整除主级别周期"
+        )
+    if raw_main and raw_sub and raw_sub[-1].time < raw_main[-1].time:
+        quality_notes.append(
+            "bars_sub 未覆盖到最新主级别已完成K线："
+            f"sub_end={raw_sub[-1].time.isoformat()}，"
+            f"main_end={raw_main[-1].time.isoformat()}"
+        )
+    if cfg.structure_construction == "recursive_1m":
+        if structural_view is None:
+            quality_notes.append("严格递归模式缺少 1m 结构回放")
+        elif structural_view.asof_time != asof:
+            quality_notes.append(
+                "1m 结构回放时刻与主分析时刻不一致："
+                f"structure={structural_view.asof_time.isoformat()}，"
+                f"asof={asof.isoformat()}"
+            )
+
+    if quality_notes:
         return _insufficient_snapshot(
             exchange=exchange,
             symbol=symbol,
@@ -130,63 +224,138 @@ def build_chan_state(
             asof_time=asof,
             bars_main=raw_main,
             bars_sub=raw_sub,
-            notes=(
-                f"bars_main={len(raw_main)} (<{cfg.min_main_bars}) 或 "
-                f"bars_sub={len(raw_sub)} (<{cfg.min_sub_bars})"
-            ),
+            notes="；".join(quality_notes),
         )
 
-    merged_main = merge_inclusions(raw_main)
-    merged_sub = merge_inclusions(raw_sub)
+    if cfg.structure_construction == "recursive_1m":
+        # In strict mode clock-30m bars are the execution/evaluation clock,
+        # not another Chan level.  The only structural chain is replayed from
+        # 1m, so rebuilding clock-30m/5m fractals here would mix definitions.
+        assert structural_view is not None
+        merged_main = raw_main
+        merged_sub = raw_sub
+        fractals_main = []
+        fractals_sub = []
+        bis_main = structural_view.bis
+        bis_sub = []
+        segments_main = structural_view.segments
+        segments_sub = []
+    else:
+        merged_main = merge_inclusions(raw_main)
+        merged_sub = merge_inclusions(raw_sub)
 
-    fractals_main = detect_fractals(merged_main, allow_equal=cfg.allow_equal_fractal)
-    fractals_sub = detect_fractals(merged_sub, allow_equal=cfg.allow_equal_fractal)
+        fractals_main = detect_fractals(
+            merged_main, allow_equal=cfg.allow_equal_fractal
+        )
+        fractals_sub = detect_fractals(
+            merged_sub, allow_equal=cfg.allow_equal_fractal
+        )
 
-    bis_main = build_bis(fractals_main, merged_main, min_bars=cfg.min_stroke_bars)
-    bis_sub = build_bis(fractals_sub, merged_sub, min_bars=cfg.min_stroke_bars)
+        bis_main = build_bis(
+            fractals_main, merged_main, min_bars=cfg.min_stroke_bars
+        )
+        bis_sub = build_bis(
+            fractals_sub, merged_sub, min_bars=cfg.min_stroke_bars
+        )
 
-    segments_main = build_segments(
-        bis_main, require_case2_confirmation=cfg.require_case2_confirmation
-    )
-    segments_sub = build_segments(
-        bis_sub, require_case2_confirmation=cfg.require_case2_confirmation
-    )
+        segments_main = build_segments(
+            bis_main, require_case2_confirmation=cfg.require_case2_confirmation
+        )
+        segments_sub = build_segments(
+            bis_sub, require_case2_confirmation=cfg.require_case2_confirmation
+        )
 
-    structure_levels_main = build_recursive_levels_from_bis(
-        bis_main,
-        timeframe=timeframe_main,
-        max_depth=3,
-    )
-    structure_levels_sub = build_recursive_levels_from_bis(
-        bis_sub,
-        timeframe=timeframe_sub,
-        max_depth=3,
-    )
+    data_quality = DataQuality(status="ok", notes="")
+    target_level = None
+    if cfg.structure_construction == "recursive_1m":
+        assert structural_view is not None
+        structure_levels_main = structural_view.levels
+        structure_levels_sub = [
+            level
+            for level in structure_levels_main
+            if level.level < cfg.structure_target_level
+        ]
+        target_level = next(
+            (
+                level
+                for level in structure_levels_main
+                if level.level == cfg.structure_target_level
+            ),
+            None,
+        )
+        sub_level = next(
+            (
+                level
+                for level in structure_levels_main
+                if level.level == cfg.structure_target_level - 1
+            ),
+            None,
+        )
+        zhongshus_main = (
+            [center.zhongshu for center in target_level.centers]
+            if target_level is not None
+            else []
+        )
+        zhongshus_sub = (
+            [center.zhongshu for center in sub_level.centers]
+            if sub_level is not None
+            else []
+        )
+        if not zhongshus_main:
+            target_name = cfg.structure_level_names[cfg.structure_target_level]
+            data_quality = DataQuality(
+                status="insufficient",
+                notes=f"结构级别 {target_name} 尚未形成已确认中枢",
+            )
+    else:
+        structure_levels_main = build_recursive_levels_from_bis(
+            bis_main,
+            timeframe=timeframe_main,
+            max_depth=3,
+        )
+        structure_levels_sub = build_recursive_levels_from_bis(
+            bis_sub,
+            timeframe=timeframe_sub,
+            max_depth=3,
+        )
 
-    zhongshus_main = [
-        center.zhongshu
-        for level in structure_levels_main[:1]
-        for center in level.centers
-        if center.level == 0
-    ] or build_zhongshus_from_bis(bis_main)
-    zhongshus_sub = [
-        center.zhongshu
-        for level in structure_levels_sub[:1]
-        for center in level.centers
-        if center.level == 0
-    ] or build_zhongshus_from_bis(bis_sub)
+        zhongshus_main = [
+            center.zhongshu
+            for level in structure_levels_main[:1]
+            for center in level.centers
+            if center.level == 0
+        ] or build_zhongshus_from_bis(bis_main)
+        zhongshus_sub = [
+            center.zhongshu
+            for level in structure_levels_sub[:1]
+            for center in level.centers
+            if center.level == 0
+        ] or build_zhongshus_from_bis(bis_sub)
 
     normalized_macd_main = _normalize_macd(macd_main, raw_main)
     normalized_macd_sub = _normalize_macd(macd_sub, raw_sub)
 
     last_close = merged_main[-1].close if merged_main else 0.0
-    market_state = infer_market_state(
-        last_close,
-        bis_main,
-        segments_main,
-        zhongshus_main,
-        structure_levels=structure_levels_main,
-    )
+    if cfg.structure_construction == "recursive_1m" and target_level is not None:
+        # Target centers are constructed from completed structural sub-level
+        # walks.  Market phase and conflict must use those same units; using
+        # clock-5m bis/segments here would silently mix two level systems.
+        structural_units = target_level.units
+        market_state = infer_market_state(
+            last_close,
+            structural_units,  # type: ignore[arg-type]
+            structural_units,  # type: ignore[arg-type]
+            zhongshus_main,
+            structure_levels=structure_levels_main,
+        )
+    else:
+        market_state = infer_market_state(
+            last_close,
+            bis_main,
+            segments_main,
+            zhongshus_main,
+            structure_levels=structure_levels_main,
+        )
 
     return ChanSnapshot(
         exchange=exchange,
@@ -210,18 +379,36 @@ def build_chan_state(
         last_zhongshu_main=zhongshus_main[-1] if zhongshus_main else None,
         trend_type_main=market_state.trend_type,
         market_state_main=market_state,
-        data_quality=DataQuality(status="ok", notes=""),
+        data_quality=data_quality,
         structure_levels_main=structure_levels_main,
         structure_levels_sub=structure_levels_sub,
     )
 
 
-def _conflict_level(snapshot: ChanSnapshot) -> tuple[str, str]:
-    if not snapshot.bis_sub:
-        return "none", "次级别笔不足，按主级别执行"
+def _conflict_level(
+    snapshot: ChanSnapshot,
+    cfg: ChanConfig,
+) -> tuple[str, str]:
+    if cfg.mode == "strict_recursive":
+        sub_level = next(
+            (
+                item
+                for item in snapshot.structure_levels_main
+                if item.level == cfg.structure_target_level - 1
+            ),
+            None,
+        )
+        if sub_level is None or not sub_level.walks:
+            return "none", "结构次级别已完成走势不足，按主级别执行"
+        sub_dir = sub_level.walks[-1].direction
+        if sub_dir == "none":
+            return "low", "结构次级别处于盘整走势"
+    else:
+        if not snapshot.bis_sub:
+            return "none", "次级别笔不足，按主级别执行"
+        sub_dir = snapshot.bis_sub[-1].direction
 
     main = snapshot.trend_type_main
-    sub_dir = snapshot.bis_sub[-1].direction
 
     if main == "up" and sub_dir == "up":
         return "none", "主次级别同向上行"
@@ -233,6 +420,12 @@ def _conflict_level(snapshot: ChanSnapshot) -> tuple[str, str]:
 
 
 def _signal_event_key(signal: Signal) -> tuple:
+    if signal.type in {"B3", "S3"} and signal.anchor_center_available_time is not None:
+        return (
+            signal.type,
+            signal.level,
+            signal.anchor_center_available_time,
+        )
     if signal.type in {"B3", "S3"} and signal.anchor_center_start_index is not None:
         return (
             signal.type,
@@ -269,9 +462,9 @@ def _expire_turning_signal_guards(
         if invalid_price is None:
             continue
         side = key[0]
-        if side == "buy" and asof_low is not None and asof_low <= float(invalid_price):
+        if side == "buy" and asof_low is not None and asof_low < float(invalid_price):
             expired.append(key)
-        elif side == "sell" and asof_high is not None and asof_high >= float(invalid_price):
+        elif side == "sell" and asof_high is not None and asof_high > float(invalid_price):
             expired.append(key)
 
     for key in expired:
@@ -368,7 +561,14 @@ def suppress_seen_signal_events(
         min_confidence,
         chan_config,
     )
-    return replace(decision, signals=kept, action=action, cn_summary=summary)
+    buy_sell_points = generate_buy_sell_points(kept, decision.divergences)
+    return replace(
+        decision,
+        signals=kept,
+        buy_sell_points=buy_sell_points,
+        action=action,
+        cn_summary=summary,
+    )
 
 
 def _fresh_signals(snapshot: ChanSnapshot, signals):
@@ -397,9 +597,9 @@ def _invalidated_after_available(
     for bar in bars:
         if bar.time <= signal.available_time or bar.time > asof_time:
             continue
-        if signal.type.startswith("B") and bar.low <= signal.invalid_price:
+        if signal.type.startswith("B") and bar.low < signal.invalid_price:
             return True
-        if signal.type.startswith("S") and bar.high >= signal.invalid_price:
+        if signal.type.startswith("S") and bar.high > signal.invalid_price:
             return True
 
     return False
@@ -539,9 +739,13 @@ def generate_signal(
 ) -> SignalDecision:
     cfg = chan_config or get_chan_config("orthodox_chan")
     threshold = (
-        macd_divergence_threshold
-        if macd_divergence_threshold > 0
-        else cfg.divergence_threshold
+        0.0
+        if cfg.mode in {"strict_recursive", "strict_kline8"}
+        else (
+            macd_divergence_threshold
+            if macd_divergence_threshold > 0
+            else cfg.divergence_threshold
+        )
     )
     confidence_floor = min_confidence if min_confidence > 0 else cfg.min_confidence
 
@@ -560,8 +764,36 @@ def generate_signal(
             cn_summary="当前数据不足，先补齐主次级别K线后再分析。",
         )
 
+    strict_mode = cfg.mode == "strict_recursive"
+    target_level = next(
+        (
+            item
+            for item in snapshot.structure_levels_main
+            if item.level == cfg.structure_target_level
+        ),
+        None,
+    )
+    structural_sub_level = next(
+        (
+            item
+            for item in snapshot.structure_levels_main
+            if item.level == cfg.structure_target_level - 1
+        ),
+        None,
+    )
+    divergence_units = (
+        target_level.units
+        if strict_mode and target_level is not None
+        else snapshot.bis_main
+    )
+    structural_walks = (
+        structural_sub_level.walks
+        if strict_mode and structural_sub_level is not None
+        else None
+    )
+
     divergence = detect_divergence_candidates(
-        bis=snapshot.bis_main,
+        bis=divergence_units,
         zhongshu_count=market_state.zhongshu_count,
         trend_type=market_state.trend_type,
         macd=snapshot.macd_main,
@@ -577,6 +809,8 @@ def generate_signal(
             ),
             snapshot.last_zhongshu_main,
         ),
+        require_completed_third_class=strict_mode,
+        structure_level=(cfg.structure_target_level if strict_mode else 0),
     )
     divergence = _sub_interval_confirmed(snapshot, divergence, threshold, cfg)
     divergence_state_items = divergence_states(divergence)
@@ -593,13 +827,16 @@ def generate_signal(
         missing_macd_penalty=cfg.missing_macd_penalty,
         transitional_confidence_cap=cfg.transitional_confidence_cap,
         bis_context=snapshot.bis_sub,
+        structural_walks=structural_walks,
+        strict_mode=strict_mode,
+        structure_level=(cfg.structure_target_level if strict_mode else 0),
     )
 
     fresh_signals = _fresh_signals(snapshot, signals)
     fresh_signals = _drop_invalidated_fresh_signals(snapshot, fresh_signals)
     buy_sell_points = generate_buy_sell_points(fresh_signals, divergence_state_items)
 
-    conflict_level, conflict_note = _conflict_level(snapshot)
+    conflict_level, conflict_note = _conflict_level(snapshot, cfg)
     oscillation_note = _oscillation_note(market_state)
     consolidation_note = _consolidation_divergence_note(divergence)
     risk_parts = [conflict_note]

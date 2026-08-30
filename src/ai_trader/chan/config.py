@@ -3,12 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-Mode = Literal["strict_kline8", "orthodox_chan", "pragmatic"]
+Mode = Literal[
+    "strict_recursive",
+    "strict_kline8",
+    "orthodox_chan",
+    "pragmatic",
+]
+StructureConstruction = Literal["clock_approximation", "recursive_1m"]
 
 
 @dataclass(slots=True)
 class ChanConfig:
     mode: Mode = "orthodox_chan"
+    structure_construction: StructureConstruction = "clock_approximation"
+    structure_target_level: int = 2
+    structure_level_names: tuple[str, ...] = ("1m", "5m", "30m")
     min_main_bars: int = 50
     min_sub_bars: int = 100
     min_stroke_bars: int = 5
@@ -31,7 +40,23 @@ class ChanConfig:
 
 
 STRICT_KLINE8 = ChanConfig(
+    mode="strict_kline8",
+    divergence_threshold=0.0,
+    execution_buy_types=("B2", "B3"),
+    execution_reduce_types=("S2", "S3"),
+    execution_sell_types=("S2", "S3"),
     require_sub_interval_confirmation=False,
+    include_consolidation_divergence_hint=False,
+)
+STRICT_RECURSIVE = ChanConfig(
+    mode="strict_recursive",
+    structure_construction="recursive_1m",
+    divergence_threshold=0.0,
+    execution_buy_types=("B2", "B3"),
+    execution_reduce_types=("S2", "S3"),
+    execution_sell_types=("S2", "S3"),
+    require_sub_interval_confirmation=False,
+    include_consolidation_divergence_hint=False,
 )
 ORTHODOX_CHAN = ChanConfig(
     mode="orthodox_chan",
@@ -63,6 +88,8 @@ PRAGMATIC = ChanConfig(
 
 
 def get_chan_config(mode: Mode = "orthodox_chan") -> ChanConfig:
+    if mode == "strict_recursive":
+        return STRICT_RECURSIVE
     if mode == "strict_kline8":
         return STRICT_KLINE8
     if mode == "orthodox_chan":

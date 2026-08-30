@@ -38,6 +38,56 @@
     }
   },
   {
+    "id": "lesson20_center_extension_keeps_original_core",
+    "lesson": 20,
+    "source_url": "https://blog.sina.com.cn/s/blog_486e105c010007zw.html",
+    "rule": "中枢区间由最初三个连续次级别走势类型确定；后续走势与该固定区间重叠只构成延伸，不重定义ZD/ZG。",
+    "runner": "build_zhongshus_from_bis",
+    "input": {
+      "bis": [
+        {
+          "idx": 0,
+          "direction": "up",
+          "start": 10.0,
+          "end": 20.0
+        },
+        {
+          "idx": 1,
+          "direction": "down",
+          "start": 22.0,
+          "end": 14.0
+        },
+        {
+          "idx": 2,
+          "direction": "up",
+          "start": 15.0,
+          "end": 24.0
+        },
+        {
+          "idx": 3,
+          "direction": "down",
+          "start": 18.0,
+          "end": 16.0
+        },
+        {
+          "idx": 4,
+          "direction": "up",
+          "start": 16.0,
+          "end": 25.0
+        }
+      ]
+    },
+    "expected": {
+      "count": 1,
+      "first": {
+        "zd": 15.0,
+        "zg": 20.0,
+        "start_index": 0,
+        "end_index": 5
+      }
+    }
+  },
+  {
     "id": "lesson20_absolute_non_overlap_is_trend_up",
     "lesson": 20,
     "source_url": "https://kline8.com/chanlun?p=20",
@@ -244,7 +294,7 @@
         "d": 98.0,
         "start_index": 0,
         "end_index": 4,
-        "time_idx": 2
+        "time_idx": 4
       },
       "bis_context": [
         {

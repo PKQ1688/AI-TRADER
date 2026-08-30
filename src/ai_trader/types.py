@@ -7,7 +7,7 @@ from typing import Any, Literal
 TrendType = Literal["up", "down", "range"]
 WalkType = Literal["consolidation", "trend"]
 ChanWalkKind = Literal["trend_up", "trend_down", "consolidation", "unknown"]
-ChanUnitKind = Literal["bar", "fractal", "bi", "segment", "walk"]
+ChanUnitKind = Literal["bar", "fractal", "bi", "segment", "center", "walk"]
 PhaseType = Literal["trending", "consolidating", "transitional"]
 SignalType = Literal["B1", "B2", "B3", "S1", "S2", "S3"]
 SignalLevel = Literal["main", "sub"]
@@ -71,6 +71,23 @@ class MACDPoint:
 
     def __post_init__(self) -> None:
         self.time = parse_utc_time(self.time)
+
+
+@dataclass(slots=True)
+class FundingRate:
+    time: datetime
+    rate: float
+    mark_price: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.time = parse_utc_time(self.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "time": iso_utc(self.time),
+            "rate": self.rate,
+            "mark_price": self.mark_price,
+        }
 
 
 @dataclass(slots=True)
@@ -250,6 +267,10 @@ class WalkState:
     center_ids: list[str] = field(default_factory=list)
     source_unit_ids: list[str] = field(default_factory=list)
     status: StructureStatus = "confirmed"
+    # A one-center walk is a consolidation by structure, but it still connects
+    # two prices in an up/down direction.  Keep that connection direction
+    # explicit so it can serve as a lower-level unit in strict recursion.
+    move_direction: Literal["up", "down", "none"] = "none"
 
     def __post_init__(self) -> None:
         self.event_time = parse_utc_time(self.event_time)
@@ -257,6 +278,8 @@ class WalkState:
 
     @property
     def direction(self) -> Literal["up", "down", "none"]:
+        if self.move_direction != "none":
+            return self.move_direction
         if self.kind == "trend_up":
             return "up"
         if self.kind == "trend_down":
@@ -415,6 +438,7 @@ class Signal:
     anchor_center_id: str | None = None
     divergence_mode: str | None = None
     structure_path: list[str] = field(default_factory=list)
+    executable: bool = True
 
     def __post_init__(self) -> None:
         self.event_time = parse_utc_time(self.event_time)
@@ -440,8 +464,14 @@ class Signal:
             "anchor_center_id": self.anchor_center_id,
             "anchor_center_start_index": self.anchor_center_start_index,
             "anchor_center_end_index": self.anchor_center_end_index,
+            "anchor_center_available_time": (
+                iso_utc(self.anchor_center_available_time)
+                if self.anchor_center_available_time is not None
+                else None
+            ),
             "divergence_mode": self.divergence_mode,
             "structure_path": list(self.structure_path),
+            "executable": self.executable,
         }
 
 
@@ -593,10 +623,31 @@ class Trade:
     slippage_cost: float
     forward_3bar_return: float
     benchmark_return: float
+    funding_pnl: float = 0.0
+    exit_reason: str = "signal"
+    signal_event_time: datetime | None = None
+    signal_available_time: datetime | None = None
+    invalid_price: float | None = None
+    max_favorable_excursion: float = 0.0
+    max_adverse_excursion: float = 0.0
+    mfe_time: datetime | None = None
+    mae_time: datetime | None = None
+    mfe_price: float | None = None
+    mae_price: float | None = None
 
     def __post_init__(self) -> None:
         self.entry_time = parse_utc_time(self.entry_time)
         self.exit_time = parse_utc_time(self.exit_time)
+        if self.signal_event_time is not None:
+            self.signal_event_time = parse_utc_time(self.signal_event_time)
+        if self.signal_available_time is not None:
+            self.signal_available_time = parse_utc_time(
+                self.signal_available_time
+            )
+        if self.mfe_time is not None:
+            self.mfe_time = parse_utc_time(self.mfe_time)
+        if self.mae_time is not None:
+            self.mae_time = parse_utc_time(self.mae_time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -614,6 +665,42 @@ class Trade:
             "slippage_cost": self.slippage_cost,
             "forward_3bar_return": self.forward_3bar_return,
             "benchmark_return": self.benchmark_return,
+            "funding_pnl": self.funding_pnl,
+            "exit_reason": self.exit_reason,
+            "holding_hours": (
+                self.exit_time - self.entry_time
+            ).total_seconds()
+            / 3600,
+            "signal_event_time": (
+                iso_utc(self.signal_event_time)
+                if self.signal_event_time is not None
+                else None
+            ),
+            "signal_available_time": (
+                iso_utc(self.signal_available_time)
+                if self.signal_available_time is not None
+                else None
+            ),
+            "confirmation_lag_hours": (
+                (
+                    self.signal_available_time - self.signal_event_time
+                ).total_seconds()
+                / 3600
+                if self.signal_event_time is not None
+                and self.signal_available_time is not None
+                else None
+            ),
+            "invalid_price": self.invalid_price,
+            "max_favorable_excursion": self.max_favorable_excursion,
+            "max_adverse_excursion": self.max_adverse_excursion,
+            "mfe_time": (
+                iso_utc(self.mfe_time) if self.mfe_time is not None else None
+            ),
+            "mae_time": (
+                iso_utc(self.mae_time) if self.mae_time is not None else None
+            ),
+            "mfe_price": self.mfe_price,
+            "mae_price": self.mae_price,
         }
 
 
@@ -648,6 +735,9 @@ class SignificanceReport:
     p_value: float
     ci_low: float
     ci_high: float
+    test_method: str = "paired_moving_block_sign_flip_one_sided"
+    confidence_method: str = "paired_moving_block_bootstrap_percentile"
+    block_size: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -663,7 +753,12 @@ class BacktestConfig:
     symbol: str = "BTC/USDT"
     timeframe_main: str = "4h"
     timeframe_sub: str = "1h"
-    chan_mode: Literal["strict_kline8", "orthodox_chan", "pragmatic"] = "orthodox_chan"
+    chan_mode: Literal[
+        "strict_recursive",
+        "strict_kline8",
+        "orthodox_chan",
+        "pragmatic",
+    ] = "orthodox_chan"
     start_utc: str = "2022-02-10T00:00:00Z"
     end_utc: str = "2026-02-10T00:00:00Z"
     history_prefetch_days: int = 365
@@ -677,12 +772,25 @@ class BacktestConfig:
     freeze_recovery_days: int = 21
     reduce_ratio: float = 0.50
     allow_short_entries: bool = True
-    benchmark: str = "time_matched_random"
+    benchmark: str = "year_matched_random_3bar"
     random_seed: int = 7
     # 0 means full-history structure rebuild; keep normal backtests bounded.
     structure_lookback_main_bars: int = DEFAULT_STRUCTURE_LOOKBACK_MAIN_BARS
     structure_lookback_sub_bars: int = DEFAULT_STRUCTURE_LOOKBACK_SUB_BARS
     check_signal_repaint: bool = False
+    repaint_check_stride: int = 1
+    liquidate_at_end: bool = False
+    invalidation_mode: Literal["intrabar", "close"] = "intrabar"
+    reversal_cooldown_bars: int = 0
+    execution_timeframe: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.invalidation_mode not in {"intrabar", "close"}:
+            raise ValueError(
+                "invalidation_mode must be 'intrabar' or 'close'"
+            )
+        if self.reversal_cooldown_bars < 0:
+            raise ValueError("reversal_cooldown_bars must be >= 0")
 
 
 @dataclass(slots=True)
@@ -695,6 +803,7 @@ class BacktestReport:
     pass_checks: dict[str, bool]
     fail_reasons: list[str]
     signal_repaint_rate: float
+    trade_diagnostics: dict[str, Any] = field(default_factory=dict)
     trades: list[Trade] = field(default_factory=list)
     signals: list[dict[str, Any]] = field(default_factory=list)
     equity_curve: list[EquityPoint] = field(default_factory=list)
@@ -709,6 +818,7 @@ class BacktestReport:
             "pass_checks": self.pass_checks,
             "fail_reasons": self.fail_reasons,
             "signal_repaint_rate": self.signal_repaint_rate,
+            "trade_diagnostics": self.trade_diagnostics,
             "trades": [item.to_dict() for item in self.trades],
             "signals": self.signals,
             "equity_curve": [item.to_dict() for item in self.equity_curve],

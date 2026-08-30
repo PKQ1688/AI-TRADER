@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from _script_utils import ensure_src_on_path
@@ -13,7 +13,7 @@ ensure_src_on_path()
 
 from ai_trader.backtest.engine import run_backtest
 from ai_trader.data.binance_ohlcv import load_ohlcv
-from ai_trader.types import BacktestConfig
+from ai_trader.types import BacktestConfig, iso_utc, parse_utc_time
 
 
 def _action_counter(report) -> dict[str, int]:
@@ -69,8 +69,24 @@ def main() -> None:
         freeze_recovery_days=21,
     )
 
-    bars_main = load_ohlcv(base_config.exchange, base_config.symbol, base_config.timeframe_main, base_config.start_utc, base_config.end_utc)
-    bars_sub = load_ohlcv(base_config.exchange, base_config.symbol, base_config.timeframe_sub, base_config.start_utc, base_config.end_utc)
+    load_start_utc = iso_utc(
+        parse_utc_time(base_config.start_utc)
+        - timedelta(days=base_config.history_prefetch_days)
+    )
+    bars_main = load_ohlcv(
+        base_config.exchange,
+        base_config.symbol,
+        base_config.timeframe_main,
+        load_start_utc,
+        base_config.end_utc,
+    )
+    bars_sub = load_ohlcv(
+        base_config.exchange,
+        base_config.symbol,
+        base_config.timeframe_sub,
+        load_start_utc,
+        base_config.end_utc,
+    )
 
     strict_cfg = replace(base_config, chan_mode="strict_kline8")
     pragmatic_cfg = replace(base_config, chan_mode="pragmatic")

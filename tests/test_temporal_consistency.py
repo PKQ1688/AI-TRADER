@@ -3,11 +3,76 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from ai_trader.chan import build_chan_state, generate_signal
+from ai_trader.chan import (
+    StructuralReplay,
+    build_chan_state,
+    build_structural_seed,
+    generate_signal,
+)
 from tests.test_utils import make_synthetic_bars
 
 
 class TemporalConsistencyTest(unittest.TestCase):
+    def test_structural_replay_matches_prefix_confirmed_structures(self) -> None:
+        start = datetime(2022, 1, 1, tzinfo=timezone.utc)
+        bars = make_synthetic_bars(
+            start=start,
+            count=1200,
+            step_hours=1,
+            drift=0.2,
+            wave_amp=280.0,
+        )
+        cutoff_index = 900
+        cutoff = bars[cutoff_index].time
+
+        full_seed = build_structural_seed(bars)
+        prefix_seed = build_structural_seed(bars[: cutoff_index + 1])
+        replay_view = StructuralReplay(full_seed).view_at(cutoff)
+
+        replay_bis = [
+            (
+                item.direction,
+                item.start_index,
+                item.end_index,
+                item.event_time,
+                item.available_time,
+            )
+            for item in replay_view.bis
+        ]
+        prefix_bis = [
+            (
+                item.direction,
+                item.start_index,
+                item.end_index,
+                item.event_time,
+                item.available_time,
+            )
+            for item in prefix_seed.bis
+        ]
+        replay_segments = [
+            (
+                item.direction,
+                item.start_index,
+                item.end_index,
+                item.event_time,
+                item.available_time,
+            )
+            for item in replay_view.segments
+        ]
+        prefix_segments = [
+            (
+                item.direction,
+                item.start_index,
+                item.end_index,
+                item.event_time,
+                item.available_time,
+            )
+            for item in prefix_seed.segments
+        ]
+
+        self.assertEqual(replay_bis, prefix_bis)
+        self.assertEqual(replay_segments, prefix_segments)
+
     def test_signal_same_for_same_asof_with_more_future_bars(self) -> None:
         start = datetime(2022, 1, 1, tzinfo=timezone.utc)
         bars_main = make_synthetic_bars(start=start, count=260, step_hours=4)
